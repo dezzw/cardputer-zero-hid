@@ -19,6 +19,14 @@ if [[ ! -f "$BINARY" ]]; then
   exit 1
 fi
 
+if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+  SOURCE_DATE_EPOCH="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || date +%s)"
+fi
+export SOURCE_DATE_EPOCH
+export TZ=UTC
+
+GLIBC_REQUIRED="$("$ROOT/packaging/glibc-required-version.sh" "$BINARY")"
+
 STAGING="$(mktemp -d)"
 trap 'rm -rf "$STAGING"' EXIT
 
@@ -52,6 +60,9 @@ install -m 0755 "${ROOT}/packaging/debian/prerm" "$DEBIAN/"
 install -m 0755 "${ROOT}/packaging/debian/postrm" "$DEBIAN/"
 printf '%s\n' '/etc/cardputer-zero-hid-app.conf' >"${DEBIAN}/conffiles"
 
+# Reproducible mtimes for every packaged file.
+find "$PKG_ROOT" -depth -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
 INSTALLED_KB="$(du -sk "${PKG_ROOT}" | cut -f1)"
 cat >"${DEBIAN}/control" <<EOF
 Package: cardputer-zero-hid
@@ -61,12 +72,15 @@ Maintainer: dezzw <dezzw@users.noreply.github.com>
 Section: utils
 Priority: optional
 Installed-Size: ${INSTALLED_KB}
-Depends: libc6 (>= 2.17)
+Depends: libc6 (>= ${GLIBC_REQUIRED})
 Description: ${DISPLAY_NAME}
  USB HID keyboard+mouse composite gadget for M5Stack Cardputer Zero (M0 scaffold).
 EOF
+touch -d "@${SOURCE_DATE_EPOCH}" "${DEBIAN}/control" "${DEBIAN}/conffiles"
 
 mkdir -p "${ROOT}/dist"
 OUTPUT="${ROOT}/dist/${PKG_FILE}"
-dpkg-deb --root-owner-group --build "${PKG_ROOT}" "$OUTPUT"
+rm -f "$OUTPUT"
+dpkg-deb --root-owner-group --build --uniform-compression -Zgzip -z9 "${PKG_ROOT}" "$OUTPUT"
 echo "$OUTPUT"
+echo "libc6 Depends: libc6 (>= ${GLIBC_REQUIRED})"

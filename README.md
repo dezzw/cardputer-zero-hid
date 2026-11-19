@@ -36,10 +36,27 @@ cargo fmt --all -- --check
 
 ### Cross-compile release binary (device)
 
+The Cardputer Zero OS image is **Debian trixie (glibc 2.41)**. CI builds the release binary inside a **`debian:trixie`** container with `gcc-aarch64-linux-gnu` so linked symbols stay **≤ GLIBC 2.41** (Ubuntu “latest” runners can link newer glibc and break on-device).
+
 ```bash
-sudo apt-get install gcc-aarch64-linux-gnu   # Debian/Ubuntu host
+# Match CI (recommended for release artifacts)
+docker run --rm -v "$PWD:/src" -w /src debian:trixie bash -lc '
+  apt-get update && apt-get install -y curl gcc-aarch64-linux-gnu
+  curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  . "$HOME/.cargo/env"
+  rustup target add aarch64-unknown-linux-gnu
+  export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+  cargo build --release --target aarch64-unknown-linux-gnu
+'
+```
+
+Host-only cross-build (dev; verify glibc with `packaging/verify-glibc-max.sh`):
+
+```bash
+sudo apt-get install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 cargo build --release --target aarch64-unknown-linux-gnu
+packaging/verify-glibc-max.sh target/aarch64-unknown-linux-gnu/release/cardputer-zero-hid 2.41
 ```
 
 Release profile is tuned for size (`opt-level = "z"`, `lto`, `strip`, `panic = "abort"`).
@@ -49,8 +66,11 @@ Release profile is tuned for size (`opt-level = "z"`, `lto`, `strip`, `panic = "
 After a successful cross-build:
 
 ```bash
+export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 packaging/build-deb.sh target/aarch64-unknown-linux-gnu/release/cardputer-zero-hid
 ```
+
+`Depends: libc6` is taken from the binary’s highest `GLIBC_*` symbol (see `packaging/glibc-required-version.sh`).
 
 Output: `dist/Cardputer Zero HID_<version>_m5stack1_arm64.deb`.
 

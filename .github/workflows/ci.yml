@@ -2,8 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main, 'feat/**', 'cursor/**']
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -38,20 +42,29 @@ jobs:
   release-arm64:
     name: cross-build, deb, artifacts
     runs-on: ubuntu-latest
+    container: debian:trixie
     needs: check
     steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git gcc-aarch64-linux-gnu \
+            binutils binutils-aarch64-linux-gnu dpkg-dev xz-utils
+
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: SOURCE_DATE_EPOCH from commit
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ env.TARGET }}
-
-      - name: Install cross toolchain and dpkg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu dpkg-dev
+          shared-key: release-${{ env.TARGET }}-trixie
 
       - name: Add Rust target
         run: rustup target add ${{ env.TARGET }}
@@ -59,31 +72,65 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --target ${{ env.TARGET }}
 
-      - name: Build .deb
-        run: packaging/build-deb.sh target/${{ env.TARGET }}/release/cardputer-zero-hid
+      - name: Verify GLIBC symbol versions
+        id: glibc
+        run: |
+          BIN="target/${{ env.TARGET }}/release/cardputer-zero-hid"
+          chmod +x packaging/glibc-required-version.sh packaging/verify-glibc-max.sh
+          REQUIRED="$(packaging/glibc-required-version.sh "$BIN")"
+          echo "required_glibc=$REQUIRED" >> "$GITHUB_OUTPUT"
+          packaging/verify-glibc-max.sh "$BIN" 2.41
+
+      - name: Build .deb (first)
+        run: |
+          chmod +x packaging/build-deb.sh
+          packaging/build-deb.sh target/${{ env.TARGET }}/release/cardputer-zero-hid
+          cp -f dist/*.deb dist/build-first.deb
+
+      - name: Build .deb (second, reproducibility)
+        id: repro
+        run: |
+          packaging/build-deb.sh target/${{ env.TARGET }}/release/cardputer-zero-hid
+          cp -f dist/*.deb dist/build-second.deb
+          SHA1=$(sha256sum dist/build-first.deb | awk '{print $1}')
+          SHA2=$(sha256sum dist/build-second.deb | awk '{print $1}')
+          echo "deb_sha256_first=$SHA1" >> "$GITHUB_ENV"
+          echo "deb_sha256_second=$SHA2" >> "$GITHUB_ENV"
+          echo "deb_sha256_first=$SHA1" >> "$GITHUB_OUTPUT"
+          echo "deb_sha256_second=$SHA2" >> "$GITHUB_OUTPUT"
+          if [[ "$SHA1" != "$SHA2" ]]; then
+            echo "error: .deb bytes differ between two builds on the same commit" >&2
+            exit 1
+          fi
+          echo "Reproducible .deb: sha256 match ($SHA1)"
 
       - name: Collect artifact sizes
         id: sizes
         run: |
           BIN="target/${{ env.TARGET }}/release/cardputer-zero-hid"
-          DEB="$(ls -1 dist/*.deb)"
+          DEB="dist/build-second.deb"
           BIN_BYTES=$(stat -c%s "$BIN")
           DEB_BYTES=$(stat -c%s "$DEB")
+          LIBC_DEPENDS=$(dpkg-deb -f "$DEB" Depends)
           echo "bin_bytes=$BIN_BYTES" >> "$GITHUB_OUTPUT"
           echo "deb_bytes=$DEB_BYTES" >> "$GITHUB_OUTPUT"
           echo "deb_path=$DEB" >> "$GITHUB_OUTPUT"
+          echo "libc_depends=$LIBC_DEPENDS" >> "$GITHUB_OUTPUT"
 
       - name: Job summary
         run: |
           {
-            echo "## Cardputer Zero HID (M0) build sizes"
+            echo "## Cardputer Zero HID (M0) build"
             echo ""
-            echo "| Artifact | Size (bytes) |"
-            echo "| --- | ---: |"
-            echo "| Stripped release binary (\`${{ env.TARGET }}\`) | ${{ steps.sizes.outputs.bin_bytes }} |"
-            echo "| Debian package | ${{ steps.sizes.outputs.deb_bytes }} |"
-            echo ""
-            echo "Package: \`${{ steps.sizes.outputs.deb_path }}\`"
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Highest GLIBC symbol | **${{ steps.glibc.outputs.required_glibc }}** (max 2.41) |"
+            echo "| \`Depends\` | \`${{ steps.sizes.outputs.libc_depends }}\` |"
+            echo "| Stripped binary (bytes) | ${{ steps.sizes.outputs.bin_bytes }} |"
+            echo "| .deb (bytes) | ${{ steps.sizes.outputs.deb_bytes }} |"
+            echo "| .deb sha256 (build 1) | \`${{ steps.repro.outputs.deb_sha256_first }}\` |"
+            echo "| .deb sha256 (build 2) | \`${{ steps.repro.outputs.deb_sha256_second }}\` |"
+            echo "| Reproducible | match |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload release binary
@@ -96,4 +143,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cardputer-zero-hid-deb
-          path: dist/*.deb
+          path: dist/build-second.deb
