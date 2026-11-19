@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feat/**', 'cursor/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  TARGET: aarch64-unknown-linux-gnu
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --verbose
+
+  release-arm64:
+    name: cross-build, deb, artifacts
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ env.TARGET }}
+
+      - name: Install cross toolchain and dpkg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu dpkg-dev
+
+      - name: Add Rust target
+        run: rustup target add ${{ env.TARGET }}
+
+      - name: cargo build --release
+        run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Build .deb
+        run: packaging/build-deb.sh target/${{ env.TARGET }}/release/cardputer-zero-hid
+
+      - name: Collect artifact sizes
+        id: sizes
+        run: |
+          BIN="target/${{ env.TARGET }}/release/cardputer-zero-hid"
+          DEB="$(ls -1 dist/*.deb)"
+          BIN_BYTES=$(stat -c%s "$BIN")
+          DEB_BYTES=$(stat -c%s "$DEB")
+          echo "bin_bytes=$BIN_BYTES" >> "$GITHUB_OUTPUT"
+          echo "deb_bytes=$DEB_BYTES" >> "$GITHUB_OUTPUT"
+          echo "deb_path=$DEB" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        run: |
+          {
+            echo "## Cardputer Zero HID (M0) build sizes"
+            echo ""
+            echo "| Artifact | Size (bytes) |"
+            echo "| --- | ---: |"
+            echo "| Stripped release binary (\`${{ env.TARGET }}\`) | ${{ steps.sizes.outputs.bin_bytes }} |"
+            echo "| Debian package | ${{ steps.sizes.outputs.deb_bytes }} |"
+            echo ""
+            echo "Package: \`${{ steps.sizes.outputs.deb_path }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cardputer-zero-hid-aarch64-release
+          path: target/${{ env.TARGET }}/release/cardputer-zero-hid
+
+      - name: Upload deb package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cardputer-zero-hid-deb
+          path: dist/*.deb

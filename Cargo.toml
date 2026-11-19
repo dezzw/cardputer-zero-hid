@@ -1,0 +1,22 @@
+[package]
+name = "cardputer_zero_hid"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.78"
+description = "USB HID keyboard+mouse composite gadget for M5Stack Cardputer Zero (scaffold)"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "cardputer-zero-hid"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
