@@ -20,7 +20,11 @@ if [[ ! -f "$BINARY" ]]; then
 fi
 
 if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
-  SOURCE_DATE_EPOCH="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || date +%s)"
+  SOURCE_DATE_EPOCH="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || true)"
+fi
+if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+  echo "error: SOURCE_DATE_EPOCH unset and git commit time unavailable" >&2
+  exit 1
 fi
 export SOURCE_DATE_EPOCH
 export TZ=UTC

@@ -58,8 +58,11 @@ jobs:
           fetch-depth: 1
 
       - name: SOURCE_DATE_EPOCH from commit
+        id: epoch
         run: |
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          EPOCH="$(git log -1 --format=%ct)"
+          echo "SOURCE_DATE_EPOCH=${EPOCH}" >> "$GITHUB_ENV"
+          echo "epoch=${EPOCH}" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -83,16 +86,24 @@ jobs:
           packaging/verify-glibc-max.sh "$BIN" 2.41
 
       - name: Build .deb (first)
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           chmod +x packaging/build-deb.sh
           packaging/build-deb.sh target/${{ env.TARGET }}/release/cardputer-zero-hid
-          cp -f dist/*.deb dist/build-first.deb
+          PKG="$(ls -1 dist/Cardputer\ Zero\ HID_*.deb)"
+          cp -f "$PKG" dist/build-first.deb
+          rm -f "$PKG"
 
       - name: Build .deb (second, reproducibility)
         id: repro
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           packaging/build-deb.sh target/${{ env.TARGET }}/release/cardputer-zero-hid
-          cp -f dist/*.deb dist/build-second.deb
+          PKG="$(ls -1 dist/Cardputer\ Zero\ HID_*.deb)"
+          cp -f "$PKG" dist/build-second.deb
+          rm -f "$PKG"
           SHA1=$(sha256sum dist/build-first.deb | awk '{print $1}')
           SHA2=$(sha256sum dist/build-second.deb | awk '{print $1}')
           echo "deb_sha256_first=$SHA1" >> "$GITHUB_ENV"
