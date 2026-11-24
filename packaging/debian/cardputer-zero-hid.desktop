@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Cardputer Zero HID
+Comment=Full keyboard and mouse USB HID gadget for CardputerZero
+Exec=/usr/bin/cardputer-zero-hid
+Icon=share/images/cardputer-zero-hid.png
+Terminal=false
+Categories=Utility;
+StartupNotify=false

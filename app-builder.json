@@ -1,0 +1,34 @@
+{
+  "app_name": "Cardputer Zero HID",
+  "package_name": "cardputer_zero_hid_app",
+  "version": "0.0.1",
+  "description": "Full keyboard and mouse USB HID gadget for CardputerZero",
+  "store": {
+    "summary": "Turn Cardputer Zero into a USB keyboard and mouse for a connected computer.",
+    "description": "Cardputer Zero HID will present the built-in keyboard as a standard USB HID keyboard and mouse composite device to a host PC. M0 is scaffold-only in this release — no HID functionality yet.\n\nPrerequisites on device\n1. Slide the USB switch to Slave (green LED off).\n2. Use a data-capable USB-C cable on the right-side Type-C port.\n\nPackaging follows the CardputerZero app store conventions used by Jiggler (intGus/jiggler, MIT).",
+    "categories": [
+      "System Tools",
+      "Hardware & IoT"
+    ],
+    "screenshots": [
+      "screenshot/cardputer-zero-hid-m0.png"
+    ],
+    "icon": "assets/images/cardputer-zero-hid.png",
+    "license": "MIT",
+    "source_repo": "https://github.com/dezzw/cardputer-zero-hid",
+    "author": {
+      "github": "dezzw",
+      "display_name": "dezzw"
+    },
+    "share_code": "CHID",
+    "permissions": {
+      "camera": false,
+      "microphone": false,
+      "imu": false,
+      "network": false,
+      "additional_hardware": false,
+      "background_service": false,
+      "external_display": false
+    }
+  }
+}
