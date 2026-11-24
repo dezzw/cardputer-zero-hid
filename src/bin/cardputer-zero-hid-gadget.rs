@@ -1,7 +1,7 @@
 //! Privileged oneshot: create or remove the USB composite HID gadget (M1).
 
 use cardputer_zero_hid::gadget::{
-    clear_restore_state, load_restore_state, persist_restore_state, teardown, take_over_confirmed,
+    clear_restore_state, load_restore_state, persist_restore_state, take_over_confirmed, teardown,
     SetupOptions, SetupResult, SysfsLayout, RESTORE_STATE_FILE,
 };
 use std::env;
@@ -31,7 +31,10 @@ fn main() {
     let layout = SysfsLayout::default();
     let state_path = Path::new(RESTORE_STATE_FILE);
 
-    if arg_refs.iter().any(|a| *a == "--remove" || *a == "--teardown") {
+    if arg_refs
+        .iter()
+        .any(|a| *a == "--remove" || *a == "--teardown")
+    {
         let restore = load_restore_state(state_path);
         if let Err(e) = teardown(&layout, restore.as_ref()) {
             eprintln!("cardputer-zero-hid-gadget: teardown failed: {e}");
@@ -47,8 +50,13 @@ fn main() {
 
     let take_over = take_over_confirmed(&arg_refs[1..]);
     let mut restore = None;
-    match cardputer_zero_hid::gadget::setup(&layout, SetupOptions { take_over_udc: take_over }, &mut restore)
-    {
+    match cardputer_zero_hid::gadget::setup(
+        &layout,
+        SetupOptions {
+            take_over_udc: take_over,
+        },
+        &mut restore,
+    ) {
         SetupResult::Active => {
             if let Some(ref state) = restore {
                 if let Err(e) = persist_restore_state(state_path, state) {

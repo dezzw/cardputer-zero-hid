@@ -85,9 +85,9 @@ pub enum SetupResult {
 }
 
 fn read_to_string(path: &Path) -> Result<String, String> {
-    fs::read_to_string(path).map(|s| s.trim().to_string()).map_err(|e| {
-        format!("read {}: {e}", path.display())
-    })
+    fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("read {}: {e}", path.display()))
 }
 
 fn write_str(path: &Path, data: &str) -> Result<(), String> {
@@ -199,7 +199,10 @@ fn modprobe_libcomposite() {
 /// Persist takeover state for a later `teardown` (systemd oneshot `ExecStop`).
 pub fn persist_restore_state(path: &Path, state: &RestoreState) -> Result<(), String> {
     let unit = state.stopped_systemd_unit.as_deref().unwrap_or("");
-    let body = format!("previous_gadget={}\nstopped_unit={unit}\n", state.previous_gadget);
+    let body = format!(
+        "previous_gadget={}\nstopped_unit={unit}\n",
+        state.previous_gadget
+    );
     write_str(path, &body)
 }
 
@@ -289,7 +292,9 @@ fn create_hid_function(
     report_len: u8,
     report_desc: &[u8],
 ) -> Result<(), String> {
-    let base = layout.gadget_dir(GADGET_NAME).join(format!("functions/{func}"));
+    let base = layout
+        .gadget_dir(GADGET_NAME)
+        .join(format!("functions/{func}"));
     mkdir_all(&base)?;
     write_str(&base.join("protocol"), &protocol.to_string())?;
     write_str(&base.join("subclass"), &BOOT_SUBCLASS.to_string())?;
@@ -300,7 +305,9 @@ fn create_hid_function(
 }
 
 fn symlink_function(layout: &SysfsLayout, func: &str) -> Result<(), String> {
-    let from = layout.gadget_dir(GADGET_NAME).join(format!("functions/{func}"));
+    let from = layout
+        .gadget_dir(GADGET_NAME)
+        .join(format!("functions/{func}"));
     let to = layout
         .gadget_dir(GADGET_NAME)
         .join(format!("configs/c.1/{func}"));
@@ -425,7 +432,10 @@ mod tests {
     use std::path::Path;
 
     fn seed_conflict_root(root: &Path, gadget: &str, udc: &str) {
-        let udc_file = root.join("sys/kernel/config/usb_gadget").join(gadget).join("UDC");
+        let udc_file = root
+            .join("sys/kernel/config/usb_gadget")
+            .join(gadget)
+            .join("UDC");
         mkdir_all(udc_file.parent().unwrap()).unwrap();
         write_str(&udc_file, udc).unwrap();
     }
@@ -449,7 +459,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         seed_conflict_root(tmp.path(), GADGET_NAME, EXPECTED_UDC);
         let layout = SysfsLayout::for_test(tmp.path());
-        assert!(detect_udc_conflict(&layout, EXPECTED_UDC).unwrap().is_none());
+        assert!(detect_udc_conflict(&layout, EXPECTED_UDC)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -500,11 +512,9 @@ mod tests {
             read_to_string(&layout.gadget_udc_file(GADGET_NAME)).unwrap(),
             EXPECTED_UDC
         );
-        assert!(
-            read_to_string(&layout.gadget_udc_file(JIGGLER_GADGET_NAME))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(read_to_string(&layout.gadget_udc_file(JIGGLER_GADGET_NAME))
+            .unwrap()
+            .is_empty());
         teardown(&layout, restore.as_ref()).unwrap();
         assert!(!layout.gadget_dir(GADGET_NAME).exists());
         assert_eq!(
