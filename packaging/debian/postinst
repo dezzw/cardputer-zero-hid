@@ -1,7 +1,8 @@
 #!/bin/sh
 set -e
-# M0: no boot-time USB gadget service yet (see intGus/jiggler postinst for the target pattern).
 if [ "$1" = "configure" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
+    systemctl enable cardputer-zero-hid-gadget.service || true
+    systemctl restart cardputer-zero-hid-gadget.service || true
 fi
 exit 0

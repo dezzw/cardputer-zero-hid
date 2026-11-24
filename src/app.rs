@@ -1,9 +1,9 @@
-//! Application orchestration (M0: prints scaffold banner and exits).
+//! Application orchestration (M1: UI/HID input still stub; gadget via systemd).
 
 use crate::gadget;
 use crate::{hid, VERSION};
 
-/// Run the application. M0 does not start HID or UI loops.
+/// Run the application. M1 does not start UI / report loops yet.
 pub fn run() -> Result<(), String> {
     run_with_options(RunOptions::from_env())
 }
@@ -28,11 +28,14 @@ pub fn run_with_options(opts: RunOptions) -> Result<(), String> {
     }
 
     eprintln!(
-        "cardputer-zero-hid v{VERSION} (M0 scaffold)\n\
-         USB gadget/HID/UI are not implemented yet.\n\
-         Expected UDC: {}\n\
+        "cardputer-zero-hid v{VERSION} (M1 gadget service)\n\
+         USB composite gadget: {} (service: cardputer-zero-hid-gadget.service)\n\
+         On-device UI / HID report loop: not implemented yet.\n\
+         UDC: {} active={}\n\
          Planned HID modes: {:?}",
+        gadget::GADGET_NAME,
         gadget::EXPECTED_UDC,
+        gadget::is_active(),
         hid::Mode::ALL.iter().map(|m| m.label()).collect::<Vec<_>>(),
     );
     Ok(())

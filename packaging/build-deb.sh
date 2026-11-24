@@ -13,9 +13,14 @@ DEB_REVISION="${DEB_REVISION:-m5stack1}"
 DEB_ARCH="${DEB_ARCH:-arm64}"
 PKG_FILE="${DISPLAY_NAME}_${VERSION}_${DEB_REVISION}_${DEB_ARCH}.deb"
 BINARY="${1:-target/aarch64-unknown-linux-gnu/release/cardputer-zero-hid}"
+GADGET_BIN="${GADGET_BIN:-${BINARY%/*}/cardputer-zero-hid-gadget}"
 
 if [[ ! -f "$BINARY" ]]; then
   echo "error: release binary not found: $BINARY" >&2
+  exit 1
+fi
+if [[ ! -f "$GADGET_BIN" ]]; then
+  echo "error: gadget daemon binary not found: $GADGET_BIN" >&2
   exit 1
 fi
 
@@ -37,6 +42,11 @@ trap 'rm -rf "$STAGING"' EXIT
 PKG_ROOT="${STAGING}/pkg"
 mkdir -p "${PKG_ROOT}/usr/bin"
 install -m 0755 "$BINARY" "${PKG_ROOT}/usr/bin/cardputer-zero-hid"
+install -m 0755 "$GADGET_BIN" "${PKG_ROOT}/usr/bin/cardputer-zero-hid-gadget"
+
+mkdir -p "${PKG_ROOT}/lib/systemd/system"
+install -m 0644 "${ROOT}/packaging/systemd/cardputer-zero-hid-gadget.service" \
+  "${PKG_ROOT}/lib/systemd/system/"
 
 mkdir -p "${PKG_ROOT}/etc"
 install -m 0644 "${ROOT}/config/cardputer-zero-hid-app.conf" "${PKG_ROOT}/etc/"
@@ -78,7 +88,7 @@ Priority: optional
 Installed-Size: ${INSTALLED_KB}
 Depends: libc6 (>= ${GLIBC_REQUIRED})
 Description: ${DISPLAY_NAME}
- USB HID keyboard+mouse composite gadget for M5Stack Cardputer Zero (M0 scaffold).
+ USB HID keyboard+mouse composite gadget for M5Stack Cardputer Zero (M1 gadget service).
 EOF
 touch -d "@${SOURCE_DATE_EPOCH}" "${DEBIAN}/control" "${DEBIAN}/conffiles"
 

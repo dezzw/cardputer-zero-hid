@@ -1,0 +1,15 @@
+[Unit]
+Description=Cardputer Zero HID USB keyboard+mouse gadget
+Documentation=https://github.com/dezzw/cardputer-zero-hid
+After=sys-kernel-config.mount systemd-modules-load.service
+Wants=sys-kernel-config.mount
+ConditionPathIsDirectory=/sys/kernel/config/usb_gadget
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/cardputer-zero-hid-gadget
+ExecStop=/usr/bin/cardputer-zero-hid-gadget --remove
+
+[Install]
+WantedBy=multi-user.target
