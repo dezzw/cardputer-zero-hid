@@ -650,12 +650,9 @@ pub fn take_over_confirmed_with(args: &[&str], env: Option<&str>, config_yes: bo
         return true;
     }
     if let Some(val) = env {
-        if take_over_value_is_yes(val) {
-            return true;
-        }
-        if take_over_value_is_no(val) {
-            return false;
-        }
+        // Env is set: only explicit yes values enable takeover; 0/empty/garbage deny
+        // and do not fall through to the conffile.
+        return take_over_value_is_yes(val);
     }
     config_yes
 }
@@ -815,9 +812,14 @@ mod tests {
         assert!(!take_over_confirmed_with(&[], None, false));
         assert!(!take_over_confirmed_with(&[], Some("0"), false));
         assert!(!take_over_confirmed_with(&[], Some(""), false));
+        assert!(!take_over_confirmed_with(&[], Some("maybe"), false));
+        assert!(!take_over_confirmed_with(&[], Some("0"), true));
+        assert!(!take_over_confirmed_with(&[], Some(""), true));
+        assert!(!take_over_confirmed_with(&[], Some("garbage"), true));
         assert!(take_over_confirmed_with(&[], Some("1"), false));
         assert!(take_over_confirmed_with(&[], Some("yes"), false));
-        assert!(!take_over_confirmed_with(&[], Some("0"), true));
+        assert!(take_over_confirmed_with(&[], Some("true"), false));
+        assert!(take_over_confirmed_with(&[], Some("on"), false));
         assert!(take_over_confirmed_with(
             &["--take-over-udc"],
             Some("0"),
