@@ -9,6 +9,8 @@ ConditionPathIsDirectory=/sys/kernel/config/usb_gadget
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Exit 0 only when cardputer_zero_hid bound; exit 3 = UDC busy/yielded (failed/inactive).
+SuccessExitStatus=0
 ExecStart=/usr/bin/cardputer-zero-hid-gadget
 ExecStop=/usr/bin/cardputer-zero-hid-gadget --remove
 

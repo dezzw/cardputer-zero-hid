@@ -67,12 +67,34 @@ impl SysfsLayout {
     }
 }
 
-/// Another gadget currently bound to [`EXPECTED_UDC`].
+/// How the UDC is occupied (configfs composite vs legacy `g_*` / platform driver).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictSource {
+    Configfs,
+    /// `/sys/class/udc/<udc>/function` — kernel ABI sysfs-class-udc.
+    SysfsDriver,
+}
+
+/// Another consumer currently using [`EXPECTED_UDC`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdcConflict {
-    pub gadget_name: String,
     pub udc: String,
+    /// configfs gadget directory name, or sysfs `function` driver name.
+    pub occupant: String,
+    pub source: ConflictSource,
 }
+
+impl UdcConflict {
+    pub fn gadget_name(&self) -> &str {
+        &self.occupant
+    }
+}
+
+/// Shell exit code when setup did not bind a gadget (systemd should not stay "active").
+pub const EXIT_SETUP_NOT_BOUND: i32 = 3;
+
+/// Shell exit code when the composite gadget is bound successfully.
+pub const EXIT_SETUP_BOUND: i32 = 0;
 
 /// State saved when [`SetupOptions::take_over_udc`] is used, for teardown restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,16 +186,72 @@ pub fn find_gadget_bound_to_udc(layout: &SysfsLayout, udc: &str) -> Result<Optio
     Ok(None)
 }
 
-/// Detect whether `udc` is in use by a gadget other than [`GADGET_NAME`].
-pub fn detect_udc_conflict(layout: &SysfsLayout, udc: &str) -> Result<Option<UdcConflict>, String> {
-    match find_gadget_bound_to_udc(layout, udc)? {
-        Some(name) if name == GADGET_NAME => Ok(None),
-        Some(gadget_name) => Ok(Some(UdcConflict {
-            gadget_name,
-            udc: udc.to_string(),
-        })),
-        None => Ok(None),
+fn udc_sysfs_path(layout: &SysfsLayout, udc: &str, attr: &str) -> PathBuf {
+    layout.udc_class.join(udc).join(attr)
+}
+
+/// Read `/sys/class/udc/<udc>/function` (name of the running USB gadget driver).
+pub fn read_udc_sysfs_function(layout: &SysfsLayout, udc: &str) -> Result<Option<String>, String> {
+    let path = udc_sysfs_path(layout, udc, "function");
+    if !path.is_file() {
+        return Ok(None);
     }
+    let value = read_to_string(&path)?;
+    if value.is_empty() || value.eq_ignore_ascii_case("(none)") {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+/// Read `/sys/class/udc/<udc>/state` (USB device state string; see sysfs-class-udc ABI).
+pub fn read_udc_sysfs_state(layout: &SysfsLayout, udc: &str) -> Result<Option<String>, String> {
+    let path = udc_sysfs_path(layout, udc, "state");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(read_to_string(&path)?))
+}
+
+/// Returns `true` when the kernel reports a bound gadget driver via sysfs `function`
+/// but configfs shows no composite bind (legacy `g_*` / platform drivers).
+pub fn legacy_udc_driver_is_active(
+    layout: &SysfsLayout,
+    udc: &str,
+    configfs_bound: &Option<String>,
+) -> Result<Option<String>, String> {
+    let driver = read_udc_sysfs_function(layout, udc)?;
+    let Some(driver) = driver else {
+        return Ok(None);
+    };
+    match configfs_bound {
+        None => Ok(Some(driver)),
+        Some(name) if name == GADGET_NAME => Ok(None),
+        Some(_) => Ok(None),
+    }
+}
+
+/// Detect whether `udc` is in use by something other than [`GADGET_NAME`].
+pub fn detect_udc_conflict(layout: &SysfsLayout, udc: &str) -> Result<Option<UdcConflict>, String> {
+    let bound = find_gadget_bound_to_udc(layout, udc)?;
+    if let Some(name) = bound {
+        if name == GADGET_NAME {
+            return Ok(None);
+        }
+        return Ok(Some(UdcConflict {
+            udc: udc.to_string(),
+            occupant: name,
+            source: ConflictSource::Configfs,
+        }));
+    }
+    if let Some(driver) = legacy_udc_driver_is_active(layout, udc, &None)? {
+        return Ok(Some(UdcConflict {
+            udc: udc.to_string(),
+            occupant: driver,
+            source: ConflictSource::SysfsDriver,
+        }));
+    }
+    Ok(None)
 }
 
 fn systemd_unit_active(unit: &str) -> bool {
@@ -266,19 +344,22 @@ fn modprobe_libcomposite() {
 pub fn persist_restore_state(path: &Path, state: &RestoreState) -> Result<(), String> {
     let unit = state.stopped_systemd_unit.as_deref().unwrap_or("");
     let body = format!(
-        "previous_gadget={}\nstopped_unit={unit}\n",
+        "took_over=1\nprevious_gadget={}\nstopped_unit={unit}\n",
         state.previous_gadget
     );
     write_str(path, &body)
 }
 
-/// Load persisted takeover state (if any).
+/// Load persisted takeover state (if any). Ignores files without `took_over=1`.
 pub fn load_restore_state(path: &Path) -> Option<RestoreState> {
     let content = fs::read_to_string(path).ok()?;
+    let mut took_over = false;
     let mut gadget = None;
     let mut unit = None;
     for line in content.lines() {
-        if let Some(v) = line.strip_prefix("previous_gadget=") {
+        if let Some(v) = line.strip_prefix("took_over=") {
+            took_over = take_over_value_is_yes(v.trim());
+        } else if let Some(v) = line.strip_prefix("previous_gadget=") {
             gadget = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("stopped_unit=") {
             let v = v.trim();
@@ -287,11 +368,45 @@ pub fn load_restore_state(path: &Path) -> Option<RestoreState> {
             }
         }
     }
+    if !took_over {
+        return None;
+    }
     let previous_gadget = gadget?;
     Some(RestoreState {
         previous_gadget,
         stopped_systemd_unit: unit,
     })
+}
+
+/// Whether a persisted takeover record still matches sysfs and is safe to apply on `--remove`.
+pub fn restore_state_is_applicable(layout: &SysfsLayout, state: &RestoreState) -> bool {
+    if legacy_udc_driver_is_active(layout, EXPECTED_UDC, &None)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return false;
+    }
+    match find_gadget_bound_to_udc(layout, EXPECTED_UDC)
+        .ok()
+        .flatten()
+        .as_deref()
+    {
+        Some(GADGET_NAME) => return false,
+        Some(other) => {
+            if other != state.previous_gadget {
+                return false;
+            }
+            if read_to_string(&layout.gadget_udc_file(other))
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        None => {}
+    }
+    layout.gadget_dir(&state.previous_gadget).is_dir() || state.stopped_systemd_unit.is_some()
 }
 
 pub fn clear_restore_state(path: &Path) {
@@ -302,7 +417,7 @@ pub fn clear_restore_state(path: &Path) {
 pub fn teardown(layout: &SysfsLayout, restore: Option<&RestoreState>) -> Result<(), String> {
     let g = layout.gadget_dir(GADGET_NAME);
     if !g.is_dir() {
-        if let Some(state) = restore {
+        if let Some(state) = restore.filter(|s| restore_state_is_applicable(layout, s)) {
             restore_previous(layout, state)?;
         }
         return Ok(());
@@ -335,7 +450,7 @@ pub fn teardown(layout: &SysfsLayout, restore: Option<&RestoreState>) -> Result<
         let _ = fs::remove_dir_all(&g);
     }
 
-    if let Some(state) = restore {
+    if let Some(state) = restore.filter(|s| restore_state_is_applicable(layout, s)) {
         restore_previous(layout, state)?;
     }
     Ok(())
@@ -396,29 +511,39 @@ pub fn setup(
     options: SetupOptions,
     restore_out: &mut Option<RestoreState>,
 ) -> SetupResult {
-    modprobe_libcomposite();
-
     let conflict = match detect_udc_conflict(layout, EXPECTED_UDC) {
         Ok(c) => c,
         Err(e) => return SetupResult::Error(e),
     };
 
-    if let Some(c) = conflict {
+    if let Some(ref c) = conflict {
         if !options.take_over_udc {
-            return SetupResult::Conflict(c);
+            return SetupResult::Conflict(c.clone());
         }
-        let stopped = stop_conflicting_unit(&c.gadget_name);
-        if let Err(e) = unbind_gadget(layout, &c.gadget_name) {
-            return SetupResult::Error(e);
+        if c.source == ConflictSource::SysfsDriver {
+            return SetupResult::Error(format!(
+                "UDC {} busy with legacy gadget driver `{}` (sysfs function); \
+                 will not bind configfs gadget",
+                c.udc, c.occupant
+            ));
         }
-        *restore_out = Some(RestoreState {
-            previous_gadget: c.gadget_name,
-            stopped_systemd_unit: stopped,
-        });
     } else if !options.take_over_udc {
         if let Some(peers) = peers_to_yield_to(&enabled_peer_gadget_units()) {
             return SetupResult::YieldPeers(peers);
         }
+    }
+
+    modprobe_libcomposite();
+
+    if let Some(c) = conflict {
+        let stopped = stop_conflicting_unit(&c.occupant);
+        if let Err(e) = unbind_gadget(layout, &c.occupant) {
+            return SetupResult::Error(e);
+        }
+        *restore_out = Some(RestoreState {
+            previous_gadget: c.occupant,
+            stopped_systemd_unit: stopped,
+        });
     }
 
     if layout.gadget_dir(GADGET_NAME).is_dir() {
@@ -535,6 +660,15 @@ pub fn take_over_confirmed_with(args: &[&str], env: Option<&str>, config_yes: bo
     config_yes
 }
 
+/// Map a setup result to an `ExecStart` exit status for systemd (`RemainAfterExit`).
+pub fn exit_code_for_setup(result: &SetupResult) -> i32 {
+    match result {
+        SetupResult::Active => EXIT_SETUP_BOUND,
+        SetupResult::Conflict(_) | SetupResult::YieldPeers(_) => EXIT_SETUP_NOT_BOUND,
+        SetupResult::Error(_) => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,7 +694,24 @@ mod tests {
         seed_conflict_root(tmp.path(), JIGGLER_GADGET_NAME, EXPECTED_UDC);
         let layout = SysfsLayout::for_test(tmp.path());
         let c = detect_udc_conflict(&layout, EXPECTED_UDC).unwrap().unwrap();
-        assert_eq!(c.gadget_name, JIGGLER_GADGET_NAME);
+        assert_eq!(c.occupant, JIGGLER_GADGET_NAME);
+        assert_eq!(c.source, ConflictSource::Configfs);
+    }
+
+    #[test]
+    fn detect_legacy_driver_via_sysfs_function() {
+        let tmp = tempfile::tempdir().unwrap();
+        let func = tmp
+            .path()
+            .join("sys/class/udc")
+            .join(EXPECTED_UDC)
+            .join("function");
+        mkdir_all(func.parent().unwrap()).unwrap();
+        write_str(&func, "g_ffs").unwrap();
+        let layout = SysfsLayout::for_test(tmp.path());
+        let c = detect_udc_conflict(&layout, EXPECTED_UDC).unwrap().unwrap();
+        assert_eq!(c.source, ConflictSource::SysfsDriver);
+        assert_eq!(c.occupant, "g_ffs");
     }
 
     #[test]
@@ -586,7 +737,7 @@ mod tests {
             },
             &mut restore,
         ) {
-            SetupResult::Conflict(c) => assert_eq!(c.gadget_name, JIGGLER_GADGET_NAME),
+            SetupResult::Conflict(c) => assert_eq!(c.occupant, JIGGLER_GADGET_NAME),
             other => panic!("expected conflict, got {other:?}"),
         }
         assert!(restore.is_none());
@@ -707,5 +858,65 @@ mod tests {
         };
         persist_restore_state(&path, &state).unwrap();
         assert_eq!(load_restore_state(&path), Some(state));
+        fs::write(&path, "previous_gadget=cp0hid\n").unwrap();
+        assert!(load_restore_state(&path).is_none());
+    }
+
+    #[test]
+    fn restore_not_applied_when_udc_owned_by_other_gadget() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_conflict_root(tmp.path(), "g1", EXPECTED_UDC);
+        let layout = SysfsLayout::for_test(tmp.path());
+        let state = RestoreState {
+            previous_gadget: JIGGLER_GADGET_NAME.to_string(),
+            stopped_systemd_unit: None,
+        };
+        assert!(!restore_state_is_applicable(&layout, &state));
+        teardown(&layout, Some(&state)).unwrap();
+        assert_eq!(
+            read_to_string(&layout.gadget_udc_file("g1")).unwrap(),
+            EXPECTED_UDC
+        );
+    }
+
+    #[test]
+    fn exit_code_for_setup_not_bound_on_conflict_or_yield() {
+        let conflict = UdcConflict {
+            udc: EXPECTED_UDC.to_string(),
+            occupant: "cp0hid".into(),
+            source: ConflictSource::Configfs,
+        };
+        assert_eq!(
+            exit_code_for_setup(&SetupResult::Conflict(conflict)),
+            EXIT_SETUP_NOT_BOUND
+        );
+        assert_eq!(
+            exit_code_for_setup(&SetupResult::YieldPeers(vec![])),
+            EXIT_SETUP_NOT_BOUND
+        );
+        assert_eq!(exit_code_for_setup(&SetupResult::Active), EXIT_SETUP_BOUND);
+    }
+
+    #[test]
+    fn setup_returns_conflict_before_creating_gadget_on_legacy_driver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let func = tmp
+            .path()
+            .join("sys/class/udc")
+            .join(EXPECTED_UDC)
+            .join("function");
+        mkdir_all(func.parent().unwrap()).unwrap();
+        write_str(&func, "android_usb").unwrap();
+        let layout = SysfsLayout::for_test(tmp.path());
+        let mut restore = None;
+        let result = setup(
+            &layout,
+            SetupOptions {
+                take_over_udc: false,
+            },
+            &mut restore,
+        );
+        assert!(matches!(result, SetupResult::Conflict(_)));
+        assert!(!layout.gadget_dir(GADGET_NAME).exists());
     }
 }
