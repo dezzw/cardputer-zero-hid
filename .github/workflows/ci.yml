@@ -93,10 +93,21 @@ jobs:
           GADGET_GLIBC="$(packaging/glibc-required-version.sh "$GADGET_BIN")"
           packaging/verify-glibc-max.sh "$BIN" 2.41
           packaging/verify-glibc-max.sh "$GADGET_BIN" 2.41
+          chmod +x packaging/glibc-symbols-report.sh
+          echo "=== cardputer-zero-hid: GLIBC_2.35+ symbols ==="
+          packaging/glibc-symbols-report.sh "$BIN" || true
+          echo "=== cardputer-zero-hid-gadget: GLIBC_2.35+ symbols ==="
+          packaging/glibc-symbols-report.sh "$GADGET_BIN" || true
           MAX="$(printf '%s\n%s\n' "$REQUIRED" "$GADGET_GLIBC" | sort -t. -k1,1n -k2,2n -V | tail -1)"
           echo "required_glibc=$MAX" >> "$GITHUB_OUTPUT"
           echo "main_glibc=$REQUIRED" >> "$GITHUB_OUTPUT"
           echo "gadget_glibc=$GADGET_GLIBC" >> "$GITHUB_OUTPUT"
+          MAIN_SHA=$(sha256sum "$BIN" | awk '{print $1}')
+          GADGET_SHA=$(sha256sum "$GADGET_BIN" | awk '{print $1}')
+          echo "main_sha256=$MAIN_SHA" >> "$GITHUB_OUTPUT"
+          echo "gadget_sha256=$GADGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "Binary sha256: cardputer-zero-hid=$MAIN_SHA"
+          echo "Binary sha256: cardputer-zero-hid-gadget=$GADGET_SHA"
 
       - name: Build .deb (first)
         env:
@@ -160,6 +171,8 @@ jobs:
             echo "| \`Depends\` field | \`${{ steps.sizes.outputs.libc_depends }}\` |"
             echo "| Stripped \`cardputer-zero-hid\` (bytes) | ${{ steps.sizes.outputs.bin_bytes }} |"
             echo "| Stripped \`cardputer-zero-hid-gadget\` (bytes) | ${{ steps.sizes.outputs.gadget_bin_bytes }} |"
+            echo "| \`cardputer-zero-hid\` sha256 | \`${{ steps.glibc.outputs.main_sha256 }}\` |"
+            echo "| \`cardputer-zero-hid-gadget\` sha256 | \`${{ steps.glibc.outputs.gadget_sha256 }}\` |"
             echo "| .deb (bytes) | ${{ steps.sizes.outputs.deb_bytes }} |"
             echo "| .deb sha256 (build 1) | \`${{ steps.repro.outputs.deb_sha256_first }}\` |"
             echo "| .deb sha256 (build 2) | \`${{ steps.repro.outputs.deb_sha256_second }}\` |"

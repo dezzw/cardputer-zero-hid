@@ -16,7 +16,11 @@ case "$1" in
     shift
     case "$*" in
       *ExecMainStatus*--value*)
-        printf '%s\n' "${SYSTEMCTL_EXEC_MAIN_STATUS:-3}"
+        if [ -n "${SYSTEMCTL_EXEC_MAIN_STATUS+set}" ]; then
+          printf '%s' "${SYSTEMCTL_EXEC_MAIN_STATUS}"
+        else
+          printf '3'
+        fi
         ;;
     esac
     exit 0
@@ -46,6 +50,14 @@ export SYSTEMCTL_RESTART_EXIT=1
 export SYSTEMCTL_EXEC_MAIN_STATUS=1
 if sh "${ROOT}/packaging/debian/postinst" configure 2>/dev/null; then
   echo "error: postinst should fail when restart fails with ExecMainStatus=1" >&2
+  exit 1
+fi
+
+# Empty ExecMainStatus must fail configure (not treated as coexistence).
+export SYSTEMCTL_RESTART_EXIT=1
+export SYSTEMCTL_EXEC_MAIN_STATUS=
+if sh "${ROOT}/packaging/debian/postinst" configure 2>/dev/null; then
+  echo "error: postinst should fail when ExecMainStatus is empty" >&2
   exit 1
 fi
 

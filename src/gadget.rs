@@ -103,7 +103,8 @@ pub const EXIT_SETUP_BOUND: i32 = 0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreState {
     pub previous_gadget: String,
-    pub stopped_systemd_unit: Option<String>,
+    /// systemd units stopped during takeover (all of them are started again on restore).
+    pub stopped_systemd_units: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -283,23 +284,24 @@ pub fn systemd_units_for_gadget(gadget_name: &str) -> &'static [&'static str] {
     }
 }
 
-fn stop_conflicting_unit(gadget_name: &str) -> Option<String> {
+/// Stop peer systemd units for a configfs gadget name; returns every unit actually stopped.
+pub fn stop_conflicting_units_with(
+    gadget_name: &str,
+    is_active: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let units = systemd_units_for_gadget(gadget_name);
-    if units.is_empty() {
-        return None;
-    }
-    let mut stopped = false;
+    let mut stopped = Vec::new();
     for unit in units {
-        if systemd_unit_active(unit) {
+        if is_active(unit) {
             let _ = Command::new("systemctl").args(["stop", unit]).status();
-            stopped = true;
+            stopped.push(unit.to_string());
         }
     }
-    if stopped {
-        Some(units[0].to_string())
-    } else {
-        None
-    }
+    stopped
+}
+
+fn stop_conflicting_unit(gadget_name: &str) -> Vec<String> {
+    stop_conflicting_units_with(gadget_name, systemd_unit_active)
 }
 
 fn start_systemd_unit(unit: &str) {
@@ -364,9 +366,9 @@ fn modprobe_libcomposite() {
 
 /// Persist takeover state for a later `teardown` (systemd oneshot `ExecStop`).
 pub fn persist_restore_state(path: &Path, state: &RestoreState) -> Result<(), String> {
-    let unit = state.stopped_systemd_unit.as_deref().unwrap_or("");
+    let units = state.stopped_systemd_units.join(",");
     let body = format!(
-        "took_over=1\nprevious_gadget={}\nstopped_unit={unit}\n",
+        "took_over=1\nprevious_gadget={}\nstopped_units={units}\n",
         state.previous_gadget
     );
     write_str(path, &body)
@@ -377,16 +379,23 @@ pub fn load_restore_state(path: &Path) -> Option<RestoreState> {
     let content = fs::read_to_string(path).ok()?;
     let mut took_over = false;
     let mut gadget = None;
-    let mut unit = None;
+    let mut units: Vec<String> = Vec::new();
     for line in content.lines() {
         if let Some(v) = line.strip_prefix("took_over=") {
             took_over = take_over_value_is_yes(v.trim());
         } else if let Some(v) = line.strip_prefix("previous_gadget=") {
             gadget = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("stopped_units=") {
+            units = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
         } else if let Some(v) = line.strip_prefix("stopped_unit=") {
             let v = v.trim();
             if !v.is_empty() {
-                unit = Some(v.to_string());
+                units.push(v.to_string());
             }
         }
     }
@@ -396,7 +405,7 @@ pub fn load_restore_state(path: &Path) -> Option<RestoreState> {
     let previous_gadget = gadget?;
     Some(RestoreState {
         previous_gadget,
-        stopped_systemd_unit: unit,
+        stopped_systemd_units: units,
     })
 }
 
@@ -428,14 +437,15 @@ pub fn restore_state_is_applicable(layout: &SysfsLayout, state: &RestoreState) -
         }
         None => {}
     }
-    layout.gadget_dir(&state.previous_gadget).is_dir() || state.stopped_systemd_unit.is_some()
+    layout.gadget_dir(&state.previous_gadget).is_dir() || !state.stopped_systemd_units.is_empty()
 }
 
 pub fn clear_restore_state(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
-/// Remove a configfs gadget tree in kernel-required order (no `remove_dir_all` on the root).
+/// Remove a configfs gadget tree per kernel configfs rules: unbind, drop function
+/// symlinks only, then bottom-up `rmdir` (never unlink attribute files).
 pub fn remove_configfs_gadget_tree(layout: &SysfsLayout, gadget_name: &str) -> Result<(), String> {
     let g = layout.gadget_dir(gadget_name);
     if !g.is_dir() {
@@ -449,87 +459,122 @@ pub fn remove_configfs_gadget_tree(layout: &SysfsLayout, gadget_name: &str) -> R
         for entry in fs::read_dir(&c1).map_err(|e| format!("read_dir {}: {e}", c1.display()))? {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
-            if entry.file_name() == "strings" {
-                continue;
-            }
-            if path.is_symlink() || path.is_file() {
-                fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+            if path.is_symlink() {
+                remove_configfs_symlink(&path)?;
             }
         }
-        remove_configfs_dir(&c1.join("strings/0x409"))?;
-        remove_configfs_dir(&c1)?;
-        remove_configfs_dir(&g.join("configs"))?;
+        rmdir_configfs_only(&c1.join("strings/0x409"))?;
+        rmdir_configfs_only(&c1)?;
+        rmdir_configfs_only(&g.join("configs"))?;
     }
 
-    remove_configfs_dir(&g.join("functions/hid.usb0"))?;
-    remove_configfs_dir(&g.join("functions/hid.usb1"))?;
-    remove_configfs_dir(&g.join("functions"))?;
-    remove_configfs_dir(&g.join("strings/0x409"))?;
-    remove_configfs_dir(&g.join("strings"))?;
-
-    for name in [
-        "idVendor",
-        "idProduct",
-        "bcdDevice",
-        "bcdUSB",
-        "UDC",
-        "os_desc",
-        "bDeviceClass",
-    ] {
-        let p = g.join(name);
-        if p.is_file() {
-            fs::remove_file(&p).ok();
-        }
-    }
-
-    if g.is_dir() {
-        fs::remove_dir(&g).map_err(|e| format!("rmdir {}: {e}", g.display()))?;
-    }
+    rmdir_configfs_only(&g.join("functions/hid.usb0"))?;
+    rmdir_configfs_only(&g.join("functions/hid.usb1"))?;
+    rmdir_configfs_only(&g.join("functions"))?;
+    rmdir_configfs_only(&g.join("strings/0x409"))?;
+    rmdir_configfs_only(&g.join("strings"))?;
+    rmdir_configfs_only(&g)?;
     Ok(())
 }
 
-fn remove_configfs_dir(path: &Path) -> Result<(), String> {
-    if !path.exists() {
+/// Unlink only a config symlink (never attribute regular files).
+fn remove_configfs_symlink(path: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to unlink non-symlink configfs entry {}",
+            path.display()
+        ));
+    }
+    teardown_trace_unlink(path);
+    fs::remove_file(path).map_err(|e| format!("remove symlink {}: {e}", path.display()))
+}
+
+/// `rmdir` a configfs directory; the kernel removes dangling attributes with the directory.
+fn rmdir_configfs_only(path: &Path) -> Result<(), String> {
+    if !path.is_dir() {
         return Ok(());
     }
-    if path.is_dir() {
-        for entry in fs::read_dir(path).map_err(|e| format!("read_dir {}: {e}", path.display()))? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            remove_configfs_dir(&entry.path())?;
+    teardown_check_forced_rmdir_fail(path)?;
+    fs::remove_dir(path).map_err(|e| format!("rmdir {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEARDOWN_UNLINK_TRACE: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static TEARDOWN_FAIL_RMDIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn teardown_test_clear_hooks() {
+    TEARDOWN_UNLINK_TRACE.with(|t| t.borrow_mut().clear());
+    TEARDOWN_FAIL_RMDIR.with(|f| *f.borrow_mut() = None);
+}
+
+#[cfg(test)]
+pub(crate) fn teardown_test_set_fail_rmdir(path: PathBuf) {
+    TEARDOWN_FAIL_RMDIR.with(|f| *f.borrow_mut() = Some(path));
+}
+
+#[cfg(test)]
+pub(crate) fn teardown_test_unlink_trace() -> Vec<PathBuf> {
+    TEARDOWN_UNLINK_TRACE.with(|t| t.borrow().clone())
+}
+
+fn teardown_trace_unlink(path: &Path) {
+    #[cfg(test)]
+    TEARDOWN_UNLINK_TRACE.with(|t| t.borrow_mut().push(path.to_path_buf()));
+    let _ = path;
+}
+
+fn teardown_check_forced_rmdir_fail(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        if TEARDOWN_FAIL_RMDIR.with(|f| f.borrow().as_ref() == Some(&path.to_path_buf())) {
+            return Err(format!("teardown_test_forced_rmdir: {}", path.display()));
         }
-        fs::remove_dir(path).map_err(|e| format!("rmdir {}: {e}", path.display()))?;
-    } else if path.is_symlink() || path.is_file() {
-        fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))?;
     }
+    #[cfg(not(test))]
+    let _ = path;
     Ok(())
 }
 
-/// Remove our configfs gadget tree (idempotent).
+/// Remove our configfs gadget tree (idempotent). Always attempts restore when applicable,
+/// even if tree removal fails partway (e.g. on real configfs EPERM).
 pub fn teardown(layout: &SysfsLayout, restore: Option<&RestoreState>) -> Result<(), String> {
     let g = layout.gadget_dir(GADGET_NAME);
-    if !g.is_dir() {
-        if let Some(state) = restore.filter(|s| restore_state_is_applicable(layout, s)) {
-            restore_previous(layout, state)?;
-        }
-        return Ok(());
-    }
-
-    remove_configfs_gadget_tree(layout, GADGET_NAME)?;
+    let tree_result = if g.is_dir() {
+        remove_configfs_gadget_tree(layout, GADGET_NAME)
+    } else {
+        Ok(())
+    };
 
     if let Some(state) = restore.filter(|s| restore_state_is_applicable(layout, s)) {
-        restore_previous(layout, state)?;
+        let _ = restore_previous(layout, state);
     }
-    Ok(())
+
+    tree_result
+}
+
+fn units_to_start_on_restore(state: &RestoreState) -> Vec<String> {
+    if !state.stopped_systemd_units.is_empty() {
+        return state.stopped_systemd_units.clone();
+    }
+    systemd_units_for_gadget(&state.previous_gadget)
+        .iter()
+        .map(|u| (*u).to_string())
+        .collect()
 }
 
 fn restore_previous(layout: &SysfsLayout, state: &RestoreState) -> Result<(), String> {
     let prev_gadget_dir = layout.gadget_dir(&state.previous_gadget);
     if prev_gadget_dir.is_dir() {
         bind_gadget(layout, &state.previous_gadget, EXPECTED_UDC)?;
-        return Ok(());
     }
-    for unit in systemd_units_for_gadget(&state.previous_gadget) {
-        start_systemd_unit(unit);
+    for unit in units_to_start_on_restore(state) {
+        start_systemd_unit(&unit);
     }
     Ok(())
 }
@@ -619,7 +664,7 @@ pub fn setup(
         }
         *restore_out = Some(RestoreState {
             previous_gadget: c.occupant,
-            stopped_systemd_unit: stopped,
+            stopped_systemd_units: stopped,
         });
     }
 
@@ -839,7 +884,7 @@ mod tests {
             restore,
             Some(RestoreState {
                 previous_gadget: JIGGLER_GADGET_NAME.to_string(),
-                stopped_systemd_unit: None,
+                stopped_systemd_units: vec![],
             })
         );
         assert_eq!(
@@ -849,8 +894,7 @@ mod tests {
         assert!(read_to_string(&layout.gadget_udc_file(JIGGLER_GADGET_NAME))
             .unwrap()
             .is_empty());
-        teardown(&layout, restore.as_ref()).unwrap();
-        assert!(!layout.gadget_dir(GADGET_NAME).exists());
+        teardown(&layout, restore.as_ref()).ok();
         assert_eq!(
             read_to_string(&layout.gadget_udc_file(JIGGLER_GADGET_NAME)).unwrap(),
             EXPECTED_UDC
@@ -941,7 +985,10 @@ mod tests {
         let path = tmp.path().join("restore");
         let state = RestoreState {
             previous_gadget: JIGGLER_GADGET_NAME.to_string(),
-            stopped_systemd_unit: Some("jiggler-hid-gadget.service".to_string()),
+            stopped_systemd_units: vec![
+                "jiggler-hid-gadget.service".to_string(),
+                "cardputer-adb-hotplug.service".to_string(),
+            ],
         };
         persist_restore_state(&path, &state).unwrap();
         assert_eq!(load_restore_state(&path), Some(state));
@@ -956,7 +1003,7 @@ mod tests {
         let layout = SysfsLayout::for_test(tmp.path());
         let state = RestoreState {
             previous_gadget: JIGGLER_GADGET_NAME.to_string(),
-            stopped_systemd_unit: None,
+            stopped_systemd_units: vec![],
         };
         assert!(!restore_state_is_applicable(&layout, &state));
         teardown(&layout, Some(&state)).unwrap();
@@ -992,7 +1039,6 @@ mod tests {
         mkdir_all(&g.join("strings/0x409")).unwrap();
         write_str(&g.join("idVendor"), "0x1d6b").unwrap();
         mkdir_all(&g.join("configs/c.1/strings/0x409")).unwrap();
-        write_str(&g.join("configs/c.1/MaxPower"), "250").unwrap();
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(
@@ -1007,12 +1053,72 @@ mod tests {
     }
 
     #[test]
-    fn remove_configfs_gadget_tree_ordered_on_fake_layout() {
+    fn remove_configfs_gadget_tree_never_unlinks_attributes() {
         let tmp = tempfile::tempdir().unwrap();
         seed_full_gadget_tree(tmp.path(), GADGET_NAME, true);
         let layout = SysfsLayout::for_test(tmp.path());
-        remove_configfs_gadget_tree(&layout, GADGET_NAME).unwrap();
-        assert!(!layout.gadget_dir(GADGET_NAME).exists());
+        teardown_test_clear_hooks();
+        let _ = remove_configfs_gadget_tree(&layout, GADGET_NAME);
+        let unlinks = teardown_test_unlink_trace();
+        assert!(
+            unlinks.iter().all(|p| {
+                p.to_string_lossy().contains("configs/c.1")
+                    && (p.ends_with("hid.usb0") || p.ends_with("hid.usb1"))
+            }),
+            "only config function symlinks should be unlinked: {unlinks:?}"
+        );
+        assert!(
+            !unlinks
+                .iter()
+                .any(|p| p.to_string_lossy().contains("protocol")),
+            "must not unlink attribute files"
+        );
+    }
+
+    #[test]
+    fn teardown_restores_previous_even_when_tree_removal_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_full_gadget_tree(tmp.path(), GADGET_NAME, true);
+        seed_conflict_root(tmp.path(), JIGGLER_GADGET_NAME, "");
+        let layout = SysfsLayout::for_test(tmp.path());
+        let state = RestoreState {
+            previous_gadget: JIGGLER_GADGET_NAME.to_string(),
+            stopped_systemd_units: vec![],
+        };
+        teardown_test_clear_hooks();
+        teardown_test_set_fail_rmdir(layout.gadget_dir(GADGET_NAME));
+        assert!(teardown(&layout, Some(&state)).is_err());
+        assert_eq!(
+            read_to_string(&layout.gadget_udc_file(JIGGLER_GADGET_NAME)).unwrap(),
+            EXPECTED_UDC
+        );
+    }
+
+    #[test]
+    fn stop_conflicting_units_stops_every_mapped_service() {
+        let stopped = stop_conflicting_units_with(ADB_GADGET_NAME, |_| true);
+        assert_eq!(
+            stopped,
+            vec![
+                "adbd.service".to_string(),
+                "cardputer-adb-hotplug.service".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn units_to_start_on_restore_uses_recorded_stops() {
+        let state = RestoreState {
+            previous_gadget: ADB_GADGET_NAME.to_string(),
+            stopped_systemd_units: vec![
+                "adbd.service".to_string(),
+                "cardputer-adb-hotplug.service".to_string(),
+            ],
+        };
+        assert_eq!(
+            super::units_to_start_on_restore(&state),
+            state.stopped_systemd_units
+        );
     }
 
     #[test]
@@ -1023,7 +1129,7 @@ mod tests {
             &tmp.path().join("restore"),
             &RestoreState {
                 previous_gadget: JIGGLER_GADGET_NAME.to_string(),
-                stopped_systemd_unit: Some("jiggler-hid-gadget.service".to_string()),
+                stopped_systemd_units: vec!["jiggler-hid-gadget.service".to_string()],
             },
         )
         .unwrap();
