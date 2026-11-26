@@ -13,9 +13,12 @@ case "$1" in
   daemon-reload) exit 0 ;;
   enable) exit 0 ;;
   show)
-    if [ "$2" = "-p" ] && [ "$3" = "ExecMainStatus" ] && [ "$4" = "--value" ]; then
-      printf '%s\n' "${SYSTEMCTL_EXEC_MAIN_STATUS:-3}"
-    fi
+    shift
+    case "$*" in
+      *ExecMainStatus*--value*)
+        printf '%s\n' "${SYSTEMCTL_EXEC_MAIN_STATUS:-3}"
+        ;;
+    esac
     exit 0
     ;;
   restart)
