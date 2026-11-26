@@ -39,6 +39,11 @@ jobs:
       - name: cargo test
         run: cargo test --verbose
 
+      - name: postinst restart (stub systemctl)
+        run: |
+          chmod +x packaging/test-postinst-restart.sh packaging/debian/postinst
+          packaging/test-postinst-restart.sh
+
   release-arm64:
     name: cross-build, deb, artifacts
     runs-on: ubuntu-latest
@@ -82,10 +87,16 @@ jobs:
         id: glibc
         run: |
           BIN="target/${{ env.TARGET }}/release/cardputer-zero-hid"
+          GADGET_BIN="target/${{ env.TARGET }}/release/cardputer-zero-hid-gadget"
           chmod +x packaging/glibc-required-version.sh packaging/verify-glibc-max.sh
           REQUIRED="$(packaging/glibc-required-version.sh "$BIN")"
-          echo "required_glibc=$REQUIRED" >> "$GITHUB_OUTPUT"
+          GADGET_GLIBC="$(packaging/glibc-required-version.sh "$GADGET_BIN")"
           packaging/verify-glibc-max.sh "$BIN" 2.41
+          packaging/verify-glibc-max.sh "$GADGET_BIN" 2.41
+          MAX="$(printf '%s\n%s\n' "$REQUIRED" "$GADGET_GLIBC" | sort -t. -k1,1n -k2,2n -V | tail -1)"
+          echo "required_glibc=$MAX" >> "$GITHUB_OUTPUT"
+          echo "main_glibc=$REQUIRED" >> "$GITHUB_OUTPUT"
+          echo "gadget_glibc=$GADGET_GLIBC" >> "$GITHUB_OUTPUT"
 
       - name: Build .deb (first)
         env:
@@ -122,11 +133,16 @@ jobs:
         id: sizes
         run: |
           BIN="target/${{ env.TARGET }}/release/cardputer-zero-hid"
+          GADGET_BIN="target/${{ env.TARGET }}/release/cardputer-zero-hid-gadget"
           DEB="dist/build-second.deb"
           BIN_BYTES=$(stat -c%s "$BIN")
+          GADGET_BIN_BYTES=$(stat -c%s "$GADGET_BIN")
           DEB_BYTES=$(stat -c%s "$DEB")
           LIBC_DEPENDS=$(dpkg-deb -f "$DEB" Depends)
+          sha256sum "$BIN" | awk '{print $1}' > dist/main-binary.sha256
+          sha256sum "$GADGET_BIN" | awk '{print $1}' > dist/gadget-binary.sha256
           echo "bin_bytes=$BIN_BYTES" >> "$GITHUB_OUTPUT"
+          echo "gadget_bin_bytes=$GADGET_BIN_BYTES" >> "$GITHUB_OUTPUT"
           echo "deb_bytes=$DEB_BYTES" >> "$GITHUB_OUTPUT"
           echo "deb_path=$DEB" >> "$GITHUB_OUTPUT"
           echo "libc_depends=$LIBC_DEPENDS" >> "$GITHUB_OUTPUT"
@@ -138,20 +154,27 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "| --- | --- |"
-            echo "| Highest GLIBC symbol | **${{ steps.glibc.outputs.required_glibc }}** (max 2.41) |"
-            echo "| \`Depends\` | \`${{ steps.sizes.outputs.libc_depends }}\` |"
-            echo "| Stripped binary (bytes) | ${{ steps.sizes.outputs.bin_bytes }} |"
+            echo "| Highest GLIBC symbol (main) | **${{ steps.glibc.outputs.main_glibc }}** |"
+            echo "| Highest GLIBC symbol (gadget) | **${{ steps.glibc.outputs.gadget_glibc }}** |"
+            echo "| Package \`Depends\` (max of both) | **${{ steps.glibc.outputs.required_glibc }}** (max 2.41) |"
+            echo "| \`Depends\` field | \`${{ steps.sizes.outputs.libc_depends }}\` |"
+            echo "| Stripped \`cardputer-zero-hid\` (bytes) | ${{ steps.sizes.outputs.bin_bytes }} |"
+            echo "| Stripped \`cardputer-zero-hid-gadget\` (bytes) | ${{ steps.sizes.outputs.gadget_bin_bytes }} |"
             echo "| .deb (bytes) | ${{ steps.sizes.outputs.deb_bytes }} |"
             echo "| .deb sha256 (build 1) | \`${{ steps.repro.outputs.deb_sha256_first }}\` |"
             echo "| .deb sha256 (build 2) | \`${{ steps.repro.outputs.deb_sha256_second }}\` |"
             echo "| Reproducible | match |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload release binary
+      - name: Upload release binaries
         uses: actions/upload-artifact@v4
         with:
           name: cardputer-zero-hid-aarch64-release
-          path: target/${{ env.TARGET }}/release/cardputer-zero-hid
+          path: |
+            target/${{ env.TARGET }}/release/cardputer-zero-hid
+            target/${{ env.TARGET }}/release/cardputer-zero-hid-gadget
+            dist/main-binary.sha256
+            dist/gadget-binary.sha256
 
       - name: Upload deb package
         uses: actions/upload-artifact@v4

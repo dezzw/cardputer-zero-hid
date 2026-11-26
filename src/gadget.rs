@@ -18,6 +18,9 @@ pub const GADGET_NAME: &str = "cardputer_zero_hid";
 /// Known gadget names that map to a systemd unit to restart on restore.
 pub const JIGGLER_GADGET_NAME: &str = "cp0hid";
 
+/// ADB composite gadget on Cardputer Zero ([CardputerZero/launcher `cardputer-adb-gadget`](https://github.com/CardputerZero/launcher)).
+pub const ADB_GADGET_NAME: &str = "g1";
+
 /// Boot-time peers that may own the slave UDC (verify on device image).
 ///
 /// - `jiggler-hid-gadget.service` — [intGus/jiggler](https://github.com/intGus/jiggler/blob/a59e756/tools/jiggler-hid-gadget.service)
@@ -262,19 +265,38 @@ fn systemd_unit_active(unit: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Map a well-known gadget directory to a boot service to restart after we release the UDC.
+/// Primary systemd unit to restart when releasing a well-known configfs gadget.
 pub fn systemd_unit_for_gadget(gadget_name: &str) -> Option<&'static str> {
     match gadget_name {
         JIGGLER_GADGET_NAME => Some("jiggler-hid-gadget.service"),
+        ADB_GADGET_NAME => Some("adbd.service"),
         _ => None,
     }
 }
 
+/// Units associated with a gadget for stop/restore (primary unit first).
+pub fn systemd_units_for_gadget(gadget_name: &str) -> &'static [&'static str] {
+    match gadget_name {
+        JIGGLER_GADGET_NAME => &["jiggler-hid-gadget.service"],
+        ADB_GADGET_NAME => &["adbd.service", "cardputer-adb-hotplug.service"],
+        _ => &[],
+    }
+}
+
 fn stop_conflicting_unit(gadget_name: &str) -> Option<String> {
-    let unit = systemd_unit_for_gadget(gadget_name)?;
-    if systemd_unit_active(unit) {
-        let _ = Command::new("systemctl").args(["stop", unit]).status();
-        Some(unit.to_string())
+    let units = systemd_units_for_gadget(gadget_name);
+    if units.is_empty() {
+        return None;
+    }
+    let mut stopped = false;
+    for unit in units {
+        if systemd_unit_active(unit) {
+            let _ = Command::new("systemctl").args(["stop", unit]).status();
+            stopped = true;
+        }
+    }
+    if stopped {
+        Some(units[0].to_string())
     } else {
         None
     }
@@ -413,6 +435,67 @@ pub fn clear_restore_state(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+/// Remove a configfs gadget tree in kernel-required order (no `remove_dir_all` on the root).
+pub fn remove_configfs_gadget_tree(layout: &SysfsLayout, gadget_name: &str) -> Result<(), String> {
+    let g = layout.gadget_dir(gadget_name);
+    if !g.is_dir() {
+        return Ok(());
+    }
+
+    let _ = unbind_gadget(layout, gadget_name);
+
+    let c1 = g.join("configs/c.1");
+    if c1.is_dir() {
+        for entry in fs::read_dir(&c1).map_err(|e| format!("read_dir {}: {e}", c1.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if entry.file_name() == "strings" {
+                continue;
+            }
+            if path.is_symlink() || path.is_file() {
+                fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+            }
+        }
+        remove_configfs_dir(&c1.join("strings/0x409"))?;
+        remove_configfs_dir(&c1)?;
+        remove_configfs_dir(&g.join("configs"))?;
+    }
+
+    remove_configfs_dir(&g.join("functions/hid.usb0"))?;
+    remove_configfs_dir(&g.join("functions/hid.usb1"))?;
+    remove_configfs_dir(&g.join("functions"))?;
+    remove_configfs_dir(&g.join("strings/0x409"))?;
+    remove_configfs_dir(&g.join("strings"))?;
+
+    for name in ["idVendor", "idProduct", "bcdDevice", "bcdUSB", "UDC", "os_desc", "bDeviceClass"] {
+        let p = g.join(name);
+        if p.is_file() {
+            fs::remove_file(&p).ok();
+        }
+    }
+
+    if g.is_dir() {
+        fs::remove_dir(&g).map_err(|e| format!("rmdir {}: {e}", g.display()))?;
+    }
+    Ok(())
+}
+
+fn remove_configfs_dir(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        for entry in fs::read_dir(path).map_err(|e| format!("read_dir {}: {e}", path.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            remove_configfs_dir(&entry.path())?;
+        }
+        fs::remove_dir(path).map_err(|e| format!("rmdir {}: {e}", path.display()))?;
+    } else if path.is_symlink() || path.is_file() {
+        fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Remove our configfs gadget tree (idempotent).
 pub fn teardown(layout: &SysfsLayout, restore: Option<&RestoreState>) -> Result<(), String> {
     let g = layout.gadget_dir(GADGET_NAME);
@@ -423,32 +506,7 @@ pub fn teardown(layout: &SysfsLayout, restore: Option<&RestoreState>) -> Result<
         return Ok(());
     }
 
-    let _ = unbind_gadget(layout, GADGET_NAME);
-
-    let links = [
-        g.join("configs/c.1/hid.usb0"),
-        g.join("configs/c.1/hid.usb1"),
-    ];
-    for link in &links {
-        if link.exists() {
-            fs::remove_file(link).ok();
-        }
-    }
-
-    for path in [
-        g.join("configs/c.1/strings/0x409"),
-        g.join("configs/c.1"),
-        g.join("functions/hid.usb0"),
-        g.join("functions/hid.usb1"),
-        g.join("strings/0x409"),
-    ] {
-        if path.is_dir() {
-            let _ = fs::remove_dir(&path);
-        }
-    }
-    if g.is_dir() {
-        let _ = fs::remove_dir_all(&g);
-    }
+    remove_configfs_gadget_tree(layout, GADGET_NAME)?;
 
     if let Some(state) = restore.filter(|s| restore_state_is_applicable(layout, s)) {
         restore_previous(layout, state)?;
@@ -460,7 +518,9 @@ fn restore_previous(layout: &SysfsLayout, state: &RestoreState) -> Result<(), St
     let prev_gadget_dir = layout.gadget_dir(&state.previous_gadget);
     if prev_gadget_dir.is_dir() {
         bind_gadget(layout, &state.previous_gadget, EXPECTED_UDC)?;
-    } else if let Some(ref unit) = state.stopped_systemd_unit {
+        return Ok(());
+    }
+    for unit in systemd_units_for_gadget(&state.previous_gadget) {
         start_systemd_unit(unit);
     }
     Ok(())
@@ -511,6 +571,15 @@ pub fn setup(
     options: SetupOptions,
     restore_out: &mut Option<RestoreState>,
 ) -> SetupResult {
+    if find_gadget_bound_to_udc(layout, EXPECTED_UDC)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(GADGET_NAME)
+    {
+        return SetupResult::Active;
+    }
+
     let conflict = match detect_udc_conflict(layout, EXPECTED_UDC) {
         Ok(c) => c,
         Err(e) => return SetupResult::Error(e),
@@ -785,12 +854,20 @@ mod tests {
     }
 
     #[test]
-    fn systemd_unit_mapping_for_jiggler() {
+    fn systemd_unit_mapping_for_known_gadgets() {
         assert_eq!(
             systemd_unit_for_gadget(JIGGLER_GADGET_NAME),
             Some("jiggler-hid-gadget.service")
         );
-        assert_eq!(systemd_unit_for_gadget("adb"), None);
+        assert_eq!(
+            systemd_unit_for_gadget(ADB_GADGET_NAME),
+            Some("adbd.service")
+        );
+        assert_eq!(
+            systemd_units_for_gadget(ADB_GADGET_NAME),
+            &["adbd.service", "cardputer-adb-hotplug.service",][..]
+        );
+        assert_eq!(systemd_unit_for_gadget("unknown"), None);
     }
 
     #[test]
@@ -897,6 +974,66 @@ mod tests {
             EXIT_SETUP_NOT_BOUND
         );
         assert_eq!(exit_code_for_setup(&SetupResult::Active), EXIT_SETUP_BOUND);
+    }
+
+    fn seed_full_gadget_tree(root: &Path, gadget: &str, bind: bool) {
+        let g = root.join("sys/kernel/config/usb_gadget").join(gadget);
+        mkdir_all(&g.join("functions/hid.usb0")).unwrap();
+        write_str(&g.join("functions/hid.usb0/protocol"), "1").unwrap();
+        mkdir_all(&g.join("functions/hid.usb1")).unwrap();
+        mkdir_all(&g.join("strings/0x409")).unwrap();
+        write_str(&g.join("idVendor"), "0x1d6b").unwrap();
+        mkdir_all(&g.join("configs/c.1/strings/0x409")).unwrap();
+        write_str(&g.join("configs/c.1/MaxPower"), "250").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                g.join("functions/hid.usb0"),
+                g.join("configs/c.1/hid.usb0"),
+            )
+            .unwrap();
+        }
+        if bind {
+            write_str(&g.join("UDC"), EXPECTED_UDC).unwrap();
+        }
+    }
+
+    #[test]
+    fn remove_configfs_gadget_tree_ordered_on_fake_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_full_gadget_tree(tmp.path(), GADGET_NAME, true);
+        let layout = SysfsLayout::for_test(tmp.path());
+        remove_configfs_gadget_tree(&layout, GADGET_NAME).unwrap();
+        assert!(!layout.gadget_dir(GADGET_NAME).exists());
+    }
+
+    #[test]
+    fn setup_is_idempotent_when_own_gadget_holds_udc() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_full_gadget_tree(tmp.path(), GADGET_NAME, true);
+        persist_restore_state(
+            &tmp.path().join("restore"),
+            &RestoreState {
+                previous_gadget: JIGGLER_GADGET_NAME.to_string(),
+                stopped_systemd_unit: Some("jiggler-hid-gadget.service".to_string()),
+            },
+        )
+        .unwrap();
+        let layout = SysfsLayout::for_test(tmp.path());
+        let mut restore = None;
+        let result = setup(
+            &layout,
+            SetupOptions {
+                take_over_udc: false,
+            },
+            &mut restore,
+        );
+        assert_eq!(result, SetupResult::Active);
+        assert!(restore.is_none());
+        assert_eq!(
+            read_to_string(&layout.gadget_udc_file(GADGET_NAME)).unwrap(),
+            EXPECTED_UDC
+        );
     }
 
     #[test]

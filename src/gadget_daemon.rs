@@ -73,9 +73,8 @@ fn finish_setup(
                     eprintln!("cardputer-zero-hid-gadget: failed to persist restore state: {e}");
                     return 1;
                 }
-            } else {
-                clear_restore_state(state_path);
             }
+            // Do not clear an existing takeover restore file on idempotent re-start.
             exit_code_for_setup(result)
         }
         SetupResult::Conflict(_) | SetupResult::YieldPeers(_) => {

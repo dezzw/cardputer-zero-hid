@@ -34,7 +34,9 @@ fi
 export SOURCE_DATE_EPOCH
 export TZ=UTC
 
-GLIBC_REQUIRED="$("$ROOT/packaging/glibc-required-version.sh" "$BINARY")"
+GLIBC_MAIN="$("$ROOT/packaging/glibc-required-version.sh" "$BINARY")"
+GLIBC_GADGET="$("$ROOT/packaging/glibc-required-version.sh" "$GADGET_BIN")"
+GLIBC_REQUIRED="$(printf '%s\n' "$GLIBC_MAIN" "$GLIBC_GADGET" | sort -t. -k1,1n -k2,2n -V | tail -1)"
 
 STAGING="$(mktemp -d)"
 trap 'rm -rf "$STAGING"' EXIT

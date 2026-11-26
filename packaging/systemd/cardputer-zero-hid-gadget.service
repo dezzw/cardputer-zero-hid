@@ -4,7 +4,7 @@ Documentation=https://github.com/dezzw/cardputer-zero-hid
 After=sys-kernel-config.mount systemd-modules-load.service
 After=jiggler-hid-gadget.service adbd.service cardputer-adb-hotplug.service
 Wants=sys-kernel-config.mount
-ConditionPathIsDirectory=/sys/kernel/config/usb_gadget
+ConditionPathExists=/sys/class/udc/3f980000.usb
 
 [Service]
 Type=oneshot
