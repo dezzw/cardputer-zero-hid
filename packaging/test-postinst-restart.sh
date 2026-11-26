@@ -32,7 +32,8 @@ esac
 STUB
 chmod +x "${STUB_BIN}/bin/systemctl"
 
-PATH="${STUB_BIN}/bin"
+# Stub systemctl first; keep standard paths for sh/rm (real systemctl not used).
+PATH="${STUB_BIN}/bin:/usr/bin:/bin"
 export PATH
 
 # Exit 3 from ExecMainStatus must let postinst configure succeed (coexistence).
