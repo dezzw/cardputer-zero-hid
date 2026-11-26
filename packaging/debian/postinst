@@ -3,6 +3,6 @@ set -e
 if [ "$1" = "configure" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
     systemctl enable cardputer-zero-hid-gadget.service || true
-    systemctl restart cardputer-zero-hid-gadget.service || true
+    systemctl restart cardputer-zero-hid-gadget.service
 fi
 exit 0

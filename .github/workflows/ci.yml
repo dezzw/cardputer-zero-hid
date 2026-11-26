@@ -112,7 +112,7 @@ jobs:
           echo "deb_sha256_second=$SHA2" >> "$GITHUB_ENV"
           echo "deb_sha256_first=$SHA1" >> "$GITHUB_OUTPUT"
           echo "deb_sha256_second=$SHA2" >> "$GITHUB_OUTPUT"
-          if [[ "$SHA1" != "$SHA2" ]]; then
+          if [ "$SHA1" != "$SHA2" ]; then
             echo "error: .deb bytes differ between two builds on the same commit" >&2
             exit 1
           fi

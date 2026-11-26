@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod gadget;
+pub mod gadget_daemon;
 pub mod hid;
 pub mod input;
 pub mod ui;

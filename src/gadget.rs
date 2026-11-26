@@ -18,6 +18,16 @@ pub const GADGET_NAME: &str = "cardputer_zero_hid";
 /// Known gadget names that map to a systemd unit to restart on restore.
 pub const JIGGLER_GADGET_NAME: &str = "cp0hid";
 
+/// Boot-time peers that may own the slave UDC (verify on device image).
+///
+/// - `jiggler-hid-gadget.service` — [intGus/jiggler](https://github.com/intGus/jiggler/blob/a59e756/tools/jiggler-hid-gadget.service)
+/// - `adbd.service`, `cardputer-adb-hotplug.service` — [CardputerZero/launcher `cardputer-adb`](https://github.com/CardputerZero/launcher/blob/master/projects/APPLaunch/APPLaunch/adb/cardputer-adb)
+pub const PEER_UDC_SYSTEMD_UNITS: &[&str] = &[
+    "jiggler-hid-gadget.service",
+    "adbd.service",
+    "cardputer-adb-hotplug.service",
+];
+
 /// Runtime file written after a takeover so `ExecStop` can restore the prior UDC owner.
 pub const RESTORE_STATE_FILE: &str = "/run/cardputer-zero-hid-gadget.restore";
 
@@ -81,7 +91,33 @@ pub struct SetupOptions {
 pub enum SetupResult {
     Active,
     Conflict(UdcConflict),
+    /// UDC is free, but a peer gadget unit is enabled; do not bind without takeover.
+    YieldPeers(Vec<String>),
     Error(String),
+}
+
+/// Parsed intent from `cardputer-zero-hid-gadget` argv (`args[0]` = program name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAction {
+    Setup,
+    Remove,
+    Help,
+}
+
+/// Map argv to a daemon action. **No extra args** means setup (systemd `ExecStart`).
+pub fn parse_daemon_action(args: &[&str]) -> DaemonAction {
+    assert!(!args.is_empty(), "argv must include program name");
+    if args.len() == 1 {
+        return DaemonAction::Setup;
+    }
+    for a in &args[1..] {
+        match *a {
+            "--remove" | "--teardown" => return DaemonAction::Remove,
+            "--help" | "-h" => return DaemonAction::Help,
+            _ => {}
+        }
+    }
+    DaemonAction::Setup
 }
 
 fn read_to_string(path: &Path) -> Result<String, String> {
@@ -168,6 +204,36 @@ fn stop_conflicting_unit(gadget_name: &str) -> Option<String> {
 
 fn start_systemd_unit(unit: &str) {
     let _ = Command::new("systemctl").args(["start", unit]).status();
+}
+
+fn systemd_unit_is_enabled(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-enabled", "--quiet", unit])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Peer gadget units currently enabled (may be mocked in tests).
+pub fn enabled_peer_gadget_units_with(check: impl Fn(&str) -> bool) -> Vec<String> {
+    PEER_UDC_SYSTEMD_UNITS
+        .iter()
+        .filter(|u| check(u))
+        .map(|u| (*u).to_string())
+        .collect()
+}
+
+pub fn enabled_peer_gadget_units() -> Vec<String> {
+    enabled_peer_gadget_units_with(systemd_unit_is_enabled)
+}
+
+/// When the UDC is free, refuse to bind if a peer gadget unit stays enabled.
+pub fn peers_to_yield_to(enabled_peers: &[String]) -> Option<Vec<String>> {
+    if enabled_peers.is_empty() {
+        None
+    } else {
+        Some(enabled_peers.to_vec())
+    }
 }
 
 fn unbind_gadget(layout: &SysfsLayout, gadget_name: &str) -> Result<(), String> {
@@ -349,6 +415,10 @@ pub fn setup(
             previous_gadget: c.gadget_name,
             stopped_systemd_unit: stopped,
         });
+    } else if !options.take_over_udc {
+        if let Some(peers) = peers_to_yield_to(&enabled_peer_gadget_units()) {
+            return SetupResult::YieldPeers(peers);
+        }
     }
 
     if layout.gadget_dir(GADGET_NAME).is_dir() {
@@ -403,27 +473,66 @@ pub fn setup(
     SetupResult::Active
 }
 
-/// Parse `TAKE_OVER_UDC=1` from the app conffile (simple key=value lines).
+/// Values treated as explicit user confirmation for UDC takeover (env + conffile).
+pub fn take_over_value_is_yes(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "yes" | "true" | "on"
+    )
+}
+
+/// Explicit denial for env override (`CARDPUTER_ZERO_HID_TAKE_OVER_UDC=0`, etc.).
+pub fn take_over_value_is_no(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "no" | "false" | "off"
+    )
+}
+
+/// Parse `TAKE_OVER_UDC=` from conffile content.
+pub fn take_over_from_config_content(content: &str) -> bool {
+    content.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((key, val)) = line.split_once('=') else {
+            return false;
+        };
+        key.trim().eq_ignore_ascii_case("TAKE_OVER_UDC") && take_over_value_is_yes(val)
+    })
+}
+
+/// Parse `TAKE_OVER_UDC=` from the app conffile path.
 pub fn take_over_from_config(path: &Path) -> bool {
     let Ok(content) = fs::read_to_string(path) else {
         return false;
     };
-    content.lines().any(|line| {
-        let line = line.split('#').next().unwrap_or("").trim();
-        line.eq_ignore_ascii_case("TAKE_OVER_UDC=1")
-            || line.eq_ignore_ascii_case("TAKE_OVER_UDC=yes")
-    })
+    take_over_from_config_content(&content)
 }
 
-/// CLI / environment override for takeover confirmation.
+/// CLI / environment / conffile takeover confirmation.
 pub fn take_over_confirmed(args: &[&str]) -> bool {
+    take_over_confirmed_with(
+        args,
+        std::env::var("CARDPUTER_ZERO_HID_TAKE_OVER_UDC")
+            .ok()
+            .as_deref(),
+        take_over_from_config(Path::new("/etc/cardputer-zero-hid-app.conf")),
+    )
+}
+
+/// Testable takeover gate (`env` = `CARDPUTER_ZERO_HID_TAKE_OVER_UDC` value if set).
+pub fn take_over_confirmed_with(args: &[&str], env: Option<&str>, config_yes: bool) -> bool {
     if args.contains(&"--take-over-udc") {
         return true;
     }
-    if std::env::var_os("CARDPUTER_ZERO_HID_TAKE_OVER_UDC").is_some() {
-        return true;
+    if let Some(val) = env {
+        if take_over_value_is_yes(val) {
+            return true;
+        }
+        if take_over_value_is_no(val) {
+            return false;
+        }
     }
-    take_over_from_config(Path::new("/etc/cardputer-zero-hid-app.conf"))
+    config_yes
 }
 
 #[cfg(test)]
@@ -537,13 +646,55 @@ mod tests {
     }
 
     #[test]
-    fn take_over_from_config_parses_flag() {
+    fn take_over_from_config_parses_explicit_yes_only() {
         let tmp = tempfile::tempdir().unwrap();
         let conf = tmp.path().join("app.conf");
         fs::write(&conf, "# comment\nTAKE_OVER_UDC=1\n").unwrap();
         assert!(take_over_from_config(&conf));
+        fs::write(&conf, "TAKE_OVER_UDC=yes\n").unwrap();
+        assert!(take_over_from_config(&conf));
         fs::write(&conf, "TAKE_OVER_UDC=0\n").unwrap();
         assert!(!take_over_from_config(&conf));
+        assert!(!take_over_from_config_content("TAKE_OVER_UDC=0\n"));
+        assert!(!take_over_from_config_content("TAKE_OVER_UDC=no\n"));
+    }
+
+    #[test]
+    fn take_over_confirmed_respects_env_values() {
+        assert!(!take_over_confirmed_with(&[], None, false));
+        assert!(!take_over_confirmed_with(&[], Some("0"), false));
+        assert!(!take_over_confirmed_with(&[], Some(""), false));
+        assert!(take_over_confirmed_with(&[], Some("1"), false));
+        assert!(take_over_confirmed_with(&[], Some("yes"), false));
+        assert!(!take_over_confirmed_with(&[], Some("0"), true));
+        assert!(take_over_confirmed_with(
+            &["--take-over-udc"],
+            Some("0"),
+            false
+        ));
+    }
+
+    #[test]
+    fn parse_daemon_action_no_args_is_setup() {
+        assert_eq!(
+            parse_daemon_action(&["cardputer-zero-hid-gadget"]),
+            DaemonAction::Setup
+        );
+    }
+
+    #[test]
+    fn peers_to_yield_to_matches_enabled_list() {
+        assert!(peers_to_yield_to(&[]).is_none());
+        let list = vec!["jiggler-hid-gadget.service".to_string()];
+        assert_eq!(peers_to_yield_to(&list), Some(list));
+    }
+
+    #[test]
+    fn enabled_peer_units_filter() {
+        let all = enabled_peer_gadget_units_with(|_| true);
+        assert_eq!(all.len(), PEER_UDC_SYSTEMD_UNITS.len());
+        let none = enabled_peer_gadget_units_with(|_| false);
+        assert!(none.is_empty());
     }
 
     #[test]
