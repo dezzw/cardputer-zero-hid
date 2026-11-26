@@ -467,7 +467,15 @@ pub fn remove_configfs_gadget_tree(layout: &SysfsLayout, gadget_name: &str) -> R
     remove_configfs_dir(&g.join("strings/0x409"))?;
     remove_configfs_dir(&g.join("strings"))?;
 
-    for name in ["idVendor", "idProduct", "bcdDevice", "bcdUSB", "UDC", "os_desc", "bDeviceClass"] {
+    for name in [
+        "idVendor",
+        "idProduct",
+        "bcdDevice",
+        "bcdUSB",
+        "UDC",
+        "os_desc",
+        "bDeviceClass",
+    ] {
         let p = g.join(name);
         if p.is_file() {
             fs::remove_file(&p).ok();
