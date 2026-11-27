@@ -305,6 +305,8 @@ fn stop_conflicting_unit(gadget_name: &str) -> Vec<String> {
 }
 
 fn start_systemd_unit(unit: &str) {
+    #[cfg(test)]
+    RESTORE_START_UNIT_TRACE.with(|t| t.borrow_mut().push(unit.to_string()));
     let _ = Command::new("systemctl").args(["start", unit]).status();
 }
 
@@ -380,12 +382,15 @@ pub fn load_restore_state(path: &Path) -> Option<RestoreState> {
     let mut took_over = false;
     let mut gadget = None;
     let mut units: Vec<String> = Vec::new();
+    let mut had_stopped_units_line = false;
+    let mut legacy_stopped_unit: Option<String> = None;
     for line in content.lines() {
         if let Some(v) = line.strip_prefix("took_over=") {
             took_over = take_over_value_is_yes(v.trim());
         } else if let Some(v) = line.strip_prefix("previous_gadget=") {
             gadget = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("stopped_units=") {
+            had_stopped_units_line = true;
             units = v
                 .split(',')
                 .map(str::trim)
@@ -395,7 +400,7 @@ pub fn load_restore_state(path: &Path) -> Option<RestoreState> {
         } else if let Some(v) = line.strip_prefix("stopped_unit=") {
             let v = v.trim();
             if !v.is_empty() {
-                units.push(v.to_string());
+                legacy_stopped_unit = Some(v.to_string());
             }
         }
     }
@@ -403,9 +408,19 @@ pub fn load_restore_state(path: &Path) -> Option<RestoreState> {
         return None;
     }
     let previous_gadget = gadget?;
+    let stopped_systemd_units = if had_stopped_units_line {
+        units
+    } else if legacy_stopped_unit.is_some() {
+        systemd_units_for_gadget(&previous_gadget)
+            .iter()
+            .map(|u| (*u).to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
     Some(RestoreState {
         previous_gadget,
-        stopped_systemd_units: units,
+        stopped_systemd_units,
     })
 }
 
@@ -465,14 +480,11 @@ pub fn remove_configfs_gadget_tree(layout: &SysfsLayout, gadget_name: &str) -> R
         }
         rmdir_configfs_only(&c1.join("strings/0x409"))?;
         rmdir_configfs_only(&c1)?;
-        rmdir_configfs_only(&g.join("configs"))?;
     }
 
     rmdir_configfs_only(&g.join("functions/hid.usb0"))?;
     rmdir_configfs_only(&g.join("functions/hid.usb1"))?;
-    rmdir_configfs_only(&g.join("functions"))?;
     rmdir_configfs_only(&g.join("strings/0x409"))?;
-    rmdir_configfs_only(&g.join("strings"))?;
     rmdir_configfs_only(&g)?;
     Ok(())
 }
@@ -490,12 +502,58 @@ fn remove_configfs_symlink(path: &Path) -> Result<(), String> {
     fs::remove_file(path).map_err(|e| format!("remove symlink {}: {e}", path.display()))
 }
 
+fn is_configfs_default_group_at_gadget_root(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !matches!(
+        name,
+        "configs" | "functions" | "strings" | "os_desc" | "webusb"
+    ) {
+        return false;
+    }
+    path.parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some("usb_gadget")
+}
+
 /// `rmdir` a configfs directory; the kernel removes dangling attributes with the directory.
 fn rmdir_configfs_only(path: &Path) -> Result<(), String> {
     if !path.is_dir() {
         return Ok(());
     }
+    if is_configfs_default_group_at_gadget_root(path) {
+        return Err(format!(
+            "refusing to rmdir configfs default group {}",
+            path.display()
+        ));
+    }
     teardown_check_forced_rmdir_fail(path)?;
+    teardown_trace_rmdir(path);
+    #[cfg(test)]
+    if path
+        .components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new("usb_gadget"))
+    {
+        return configfs_test_rmdir(path);
+    }
+    fs::remove_dir(path).map_err(|e| format!("rmdir {}: {e}", path.display()))
+}
+
+/// Test fake configfs: emulate the kernel removing attributes when a directory is `rmdir`d.
+#[cfg(test)]
+fn configfs_test_rmdir(path: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(path).map_err(|e| format!("read_dir {}: {e}", path.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let p = entry.path();
+        if p.is_dir() {
+            configfs_test_rmdir(&p)?;
+        } else if p.is_file() {
+            fs::remove_file(&p).map_err(|e| format!("test cleanup {}: {e}", p.display()))?;
+        }
+    }
     fs::remove_dir(path).map_err(|e| format!("rmdir {}: {e}", path.display()))
 }
 
@@ -503,14 +561,23 @@ fn rmdir_configfs_only(path: &Path) -> Result<(), String> {
 thread_local! {
     static TEARDOWN_UNLINK_TRACE: std::cell::RefCell<Vec<PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static TEARDOWN_RMDIR_TRACE: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static TEARDOWN_FAIL_RMDIR: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    static RESTORE_START_UNIT_TRACE: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static RESTORE_FAIL_BIND: std::cell::RefCell<bool> =
+        const { std::cell::RefCell::new(false) };
 }
 
 #[cfg(test)]
 pub(crate) fn teardown_test_clear_hooks() {
     TEARDOWN_UNLINK_TRACE.with(|t| t.borrow_mut().clear());
+    TEARDOWN_RMDIR_TRACE.with(|t| t.borrow_mut().clear());
     TEARDOWN_FAIL_RMDIR.with(|f| *f.borrow_mut() = None);
+    RESTORE_START_UNIT_TRACE.with(|t| t.borrow_mut().clear());
+    RESTORE_FAIL_BIND.with(|f| *f.borrow_mut() = false);
 }
 
 #[cfg(test)]
@@ -521,6 +588,28 @@ pub(crate) fn teardown_test_set_fail_rmdir(path: PathBuf) {
 #[cfg(test)]
 pub(crate) fn teardown_test_unlink_trace() -> Vec<PathBuf> {
     TEARDOWN_UNLINK_TRACE.with(|t| t.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn teardown_test_rmdir_trace() -> Vec<PathBuf> {
+    TEARDOWN_RMDIR_TRACE.with(|t| t.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn restore_test_start_unit_trace() -> Vec<String> {
+    RESTORE_START_UNIT_TRACE.with(|t| t.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn restore_test_set_fail_bind(fail: bool) {
+    RESTORE_FAIL_BIND.with(|f| *f.borrow_mut() = fail);
+}
+
+fn teardown_trace_rmdir(path: &Path) {
+    #[cfg(test)]
+    TEARDOWN_RMDIR_TRACE.with(|t| t.borrow_mut().push(path.to_path_buf()));
+    #[cfg(not(test))]
+    let _ = path;
 }
 
 fn teardown_trace_unlink(path: &Path) {
@@ -559,24 +648,28 @@ pub fn teardown(layout: &SysfsLayout, restore: Option<&RestoreState>) -> Result<
 }
 
 fn units_to_start_on_restore(state: &RestoreState) -> Vec<String> {
-    if !state.stopped_systemd_units.is_empty() {
-        return state.stopped_systemd_units.clone();
-    }
-    systemd_units_for_gadget(&state.previous_gadget)
-        .iter()
-        .map(|u| (*u).to_string())
-        .collect()
+    state.stopped_systemd_units.clone()
 }
 
 fn restore_previous(layout: &SysfsLayout, state: &RestoreState) -> Result<(), String> {
     let prev_gadget_dir = layout.gadget_dir(&state.previous_gadget);
-    if prev_gadget_dir.is_dir() {
-        bind_gadget(layout, &state.previous_gadget, EXPECTED_UDC)?;
-    }
+    let bind_result = if prev_gadget_dir.is_dir() {
+        restore_bind_gadget(layout, &state.previous_gadget, EXPECTED_UDC)
+    } else {
+        Ok(())
+    };
     for unit in units_to_start_on_restore(state) {
         start_systemd_unit(&unit);
     }
-    Ok(())
+    bind_result
+}
+
+fn restore_bind_gadget(layout: &SysfsLayout, gadget_name: &str, udc: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if RESTORE_FAIL_BIND.with(|f| *f.borrow()) {
+        return Err("restore_test_forced_bind_fail".into());
+    }
+    bind_gadget(layout, gadget_name, udc)
 }
 
 fn create_hid_function(
@@ -894,7 +987,7 @@ mod tests {
         assert!(read_to_string(&layout.gadget_udc_file(JIGGLER_GADGET_NAME))
             .unwrap()
             .is_empty());
-        teardown(&layout, restore.as_ref()).ok();
+        teardown(&layout, restore.as_ref()).unwrap();
         assert_eq!(
             read_to_string(&layout.gadget_udc_file(JIGGLER_GADGET_NAME)).unwrap(),
             EXPECTED_UDC
@@ -1038,6 +1131,7 @@ mod tests {
         mkdir_all(&g.join("functions/hid.usb1")).unwrap();
         mkdir_all(&g.join("strings/0x409")).unwrap();
         write_str(&g.join("idVendor"), "0x1d6b").unwrap();
+        mkdir_all(&g.join("os_desc")).unwrap();
         mkdir_all(&g.join("configs/c.1/strings/0x409")).unwrap();
         #[cfg(unix)]
         {
@@ -1052,13 +1146,22 @@ mod tests {
         }
     }
 
+    fn default_group_path(gadget_root: &Path, name: &str) -> PathBuf {
+        gadget_root.join(name)
+    }
+
     #[test]
     fn remove_configfs_gadget_tree_never_unlinks_attributes() {
         let tmp = tempfile::tempdir().unwrap();
         seed_full_gadget_tree(tmp.path(), GADGET_NAME, true);
         let layout = SysfsLayout::for_test(tmp.path());
+        let g = layout.gadget_dir(GADGET_NAME);
         teardown_test_clear_hooks();
-        let _ = remove_configfs_gadget_tree(&layout, GADGET_NAME);
+        remove_configfs_gadget_tree(&layout, GADGET_NAME).unwrap();
+        assert!(
+            !layout.gadget_dir(GADGET_NAME).exists(),
+            "gadget directory should be removed"
+        );
         let unlinks = teardown_test_unlink_trace();
         assert!(
             unlinks.iter().all(|p| {
@@ -1072,6 +1175,19 @@ mod tests {
                 .iter()
                 .any(|p| p.to_string_lossy().contains("protocol")),
             "must not unlink attribute files"
+        );
+        let rmdirs = teardown_test_rmdir_trace();
+        for forbidden in ["configs", "functions", "strings", "os_desc", "webusb"] {
+            let p = default_group_path(&g, forbidden);
+            assert!(
+                !rmdirs.iter().any(|r| r == &p),
+                "must not rmdir configfs default group {}",
+                forbidden
+            );
+        }
+        assert!(
+            rmdirs.iter().any(|r| r == &g),
+            "gadget root must be rmdir'd"
         );
     }
 
@@ -1118,6 +1234,57 @@ mod tests {
         assert_eq!(
             super::units_to_start_on_restore(&state),
             state.stopped_systemd_units
+        );
+    }
+
+    #[test]
+    fn units_to_start_on_restore_empty_without_recorded_stops() {
+        let state = RestoreState {
+            previous_gadget: ADB_GADGET_NAME.to_string(),
+            stopped_systemd_units: vec![],
+        };
+        assert!(super::units_to_start_on_restore(&state).is_empty());
+    }
+
+    #[test]
+    fn load_restore_state_legacy_stopped_unit_expands_gadget_units() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("restore");
+        fs::write(
+            &path,
+            "took_over=1\nprevious_gadget=g1\nstopped_unit=adbd.service\n",
+        )
+        .unwrap();
+        let state = load_restore_state(&path).expect("legacy restore file");
+        assert_eq!(
+            state.stopped_systemd_units,
+            vec![
+                "adbd.service".to_string(),
+                "cardputer-adb-hotplug.service".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_previous_starts_units_even_when_bind_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_conflict_root(tmp.path(), ADB_GADGET_NAME, "");
+        let layout = SysfsLayout::for_test(tmp.path());
+        let state = RestoreState {
+            previous_gadget: ADB_GADGET_NAME.to_string(),
+            stopped_systemd_units: vec![
+                "adbd.service".to_string(),
+                "cardputer-adb-hotplug.service".to_string(),
+            ],
+        };
+        teardown_test_clear_hooks();
+        restore_test_set_fail_bind(true);
+        let err = super::restore_previous(&layout, &state).unwrap_err();
+        assert!(err.contains("restore_test_forced_bind_fail"));
+        assert_eq!(
+            restore_test_start_unit_trace(),
+            state.stopped_systemd_units,
+            "units must start even when bind fails"
         );
     }
 
