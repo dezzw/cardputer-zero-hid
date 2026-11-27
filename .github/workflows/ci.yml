@@ -95,9 +95,17 @@ jobs:
           packaging/verify-glibc-max.sh "$GADGET_BIN" 2.41
           chmod +x packaging/glibc-symbols-report.sh
           echo "=== cardputer-zero-hid: GLIBC_2.35+ symbols ==="
-          packaging/glibc-symbols-report.sh "$BIN" || true
+          MAIN_GLIBC_35="$(packaging/glibc-symbols-report.sh "$BIN")"
+          echo "$MAIN_GLIBC_35"
           echo "=== cardputer-zero-hid-gadget: GLIBC_2.35+ symbols ==="
-          packaging/glibc-symbols-report.sh "$GADGET_BIN" || true
+          GADGET_GLIBC_35="$(packaging/glibc-symbols-report.sh "$GADGET_BIN")"
+          echo "$GADGET_GLIBC_35"
+          GADGET_GLIBC_35_ONELINE="$(printf '%s\n' "$GADGET_GLIBC_35" | paste -sd ', ' -)"
+          {
+            echo "gadget_glibc_35_symbols<<EOF"
+            printf '%s\n' "$GADGET_GLIBC_35_ONELINE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
           MAX="$(printf '%s\n%s\n' "$REQUIRED" "$GADGET_GLIBC" | sort -t. -k1,1n -k2,2n -V | tail -1)"
           echo "required_glibc=$MAX" >> "$GITHUB_OUTPUT"
           echo "main_glibc=$REQUIRED" >> "$GITHUB_OUTPUT"
@@ -167,6 +175,7 @@ jobs:
             echo "| --- | --- |"
             echo "| Highest GLIBC symbol (main) | **${{ steps.glibc.outputs.main_glibc }}** |"
             echo "| Highest GLIBC symbol (gadget) | **${{ steps.glibc.outputs.gadget_glibc }}** |"
+            echo "| GLIBC_2.35+ symbols (gadget) | \`${{ steps.glibc.outputs.gadget_glibc_35_symbols }}\` |"
             echo "| Package \`Depends\` (max of both) | **${{ steps.glibc.outputs.required_glibc }}** (max 2.41) |"
             echo "| \`Depends\` field | \`${{ steps.sizes.outputs.libc_depends }}\` |"
             echo "| Stripped \`cardputer-zero-hid\` (bytes) | ${{ steps.sizes.outputs.bin_bytes }} |"
