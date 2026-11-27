@@ -11,6 +11,13 @@ readme = "README.md"
 name = "cardputer-zero-hid"
 path = "src/main.rs"
 
+[[bin]]
+name = "cardputer-zero-hid-gadget"
+path = "src/bin/cardputer-zero-hid-gadget.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = "z"
 lto = true

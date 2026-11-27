@@ -27,7 +27,7 @@
       "imu": false,
       "network": false,
       "additional_hardware": false,
-      "background_service": false,
+      "background_service": true,
       "external_display": false
     }
   }

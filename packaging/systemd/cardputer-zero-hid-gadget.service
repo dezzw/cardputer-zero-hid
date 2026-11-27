@@ -1,0 +1,18 @@
+[Unit]
+Description=Cardputer Zero HID USB keyboard+mouse gadget
+Documentation=https://github.com/dezzw/cardputer-zero-hid
+After=sys-kernel-config.mount systemd-modules-load.service
+After=jiggler-hid-gadget.service adbd.service cardputer-adb-hotplug.service
+Wants=sys-kernel-config.mount
+ConditionPathExists=/sys/class/udc/3f980000.usb
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Exit 0 only when cardputer_zero_hid bound; exit 3 = UDC busy/yielded (failed/inactive).
+SuccessExitStatus=0
+ExecStart=/usr/bin/cardputer-zero-hid-gadget
+ExecStop=/usr/bin/cardputer-zero-hid-gadget --remove
+
+[Install]
+WantedBy=multi-user.target

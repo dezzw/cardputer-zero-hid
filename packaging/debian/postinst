@@ -1,7 +1,26 @@
 #!/bin/sh
 set -e
-# M0: no boot-time USB gadget service yet (see intGus/jiggler postinst for the target pattern).
+
+# Restart after package configure. ExecStart may exit 3 (UDC busy / yield to jiggler or
+# ADB) — that is success for dpkg but must not be treated like a bound gadget (unit stays
+# failed/inactive, SuccessExitStatus=0 only).
+restart_cardputer_zero_hid_gadget() {
+    if systemctl restart cardputer-zero-hid-gadget.service; then
+        return 0
+    fi
+    status="$(systemctl show -p ExecMainStatus --value cardputer-zero-hid-gadget.service 2>/dev/null || true)"
+    if [ -z "$status" ]; then
+        return 1
+    fi
+    case "$status" in
+        3) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 if [ "$1" = "configure" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
+    systemctl enable cardputer-zero-hid-gadget.service || true
+    restart_cardputer_zero_hid_gadget
 fi
 exit 0
